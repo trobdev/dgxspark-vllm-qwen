@@ -1,0 +1,22 @@
+# Secrets — never commit
+.env
+
+# Local agent/tooling config
+.claude/
+
+# TLS private keys and certificates (dir is auto-created by Docker on `up`)
+nginx/certs/
+
+# Model weights — downloaded to MODEL_PATH (default /data/models), never vendored
+*.safetensors
+*.bin
+*.gguf
+models/
+
+# Generated docs — markdown + SVG are canonical; don't commit rendered PDFs
+*.pdf
+
+# Python / OS cruft
+__pycache__/
+*.pyc
+.DS_Store

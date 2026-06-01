@@ -1,0 +1,137 @@
+name: dgx-llm-stack
+
+services:
+
+  # ── Qwen3.6-35B-A3B-NVFP4 coding model ───────
+  vllm-coding:
+    image: vllm-node:latest  # Built locally via eugr/spark-vllm-docker for DGX Spark driver 580.x — must be vLLM ≥0.19 for NVFP4 support
+    container_name: vllm-coding
+    runtime: nvidia
+    restart: "no"
+    networks:
+      - llm-net
+    volumes:
+      - models:/models
+      - huggingface-cache:/root/.cache/huggingface
+      - ./moe-configs:/moe-configs:ro
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_TOKEN=${HF_TOKEN:-}
+      - VLLM_LOGGING_LEVEL=WARNING
+      - VLLM_TUNED_CONFIG_FOLDER=/moe-configs
+    command:
+      - "python3"
+      - "-m"
+      - "vllm.entrypoints.openai.api_server"
+      - "--model"
+      - "/models/Qwen3.6-35B-A3B-NVFP4"
+      - "--served-model-name"
+      - "coding"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      - "--max-model-len"
+      - "131072"
+      - "--gpu-memory-utilization"
+      - "0.85"
+      - "--tensor-parallel-size"
+      - "1"
+      - "--enable-prefix-caching"
+      - "--max-num-seqs"
+      - "32"
+      - "--reasoning-parser"
+      - "qwen3"
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser"
+      - "qwen3_coder"
+      - "--language-model-only"    # Skip vision encoder — not needed for coding, frees VRAM for KV cache
+      # NOTE: ngram speculative decoding (--spec-method ngram --spec-tokens 5) was
+      # removed — on vLLM 0.22.1rc1 it crashed EngineCore with a KV-cache block
+      # accounting assertion (num_required_blocks off by one) on large contexts.
+      # Re-enable once on a vLLM release where that's fixed.
+    ports:
+      # Direct vLLM port — bound to loopback only (debug/local use).
+      # This bypasses Nginx, so it must NOT be reachable from the network:
+      # anything that can hit it gets unauthenticated, unencrypted model access.
+      - "127.0.0.1:8001:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+
+  # ── Anthropic normalizing shim ─────────────────
+  # Claude Code injects a system-role message into messages[]; vLLM's native
+  # /v1/messages rejects non-user/assistant roles. This dependency-free stdlib
+  # shim hoists system-role messages into the top-level `system` field and
+  # forwards to vLLM, keeping the native Anthropic path (preserves `thinking`).
+  anthropic-shim:
+    image: python:3.12-slim
+    container_name: anthropic-shim
+    restart: "no"
+    networks:
+      - llm-net
+    volumes:
+      - ./shim/shim.py:/app/shim.py:ro
+    environment:
+      - VLLM_UPSTREAM=http://vllm-coding:8000
+    command: ["python3", "/app/shim.py"]
+    depends_on:
+      vllm-coding:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── Nginx reverse proxy ────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    restart: "no"
+    networks:
+      - llm-net
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro       # Optional: add TLS certs here
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      vllm-coding:
+        condition: service_healthy
+      anthropic-shim:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+
+# ─────────────────────────────────────────────
+#  Networks & Volumes
+# ─────────────────────────────────────────────
+networks:
+  llm-net:
+    driver: bridge
+
+volumes:
+  models:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${MODEL_PATH:-/data/models}
+
+  huggingface-cache:
+    driver: local
