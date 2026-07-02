@@ -46,6 +46,8 @@ services:
       - "--tool-call-parser"
       - "qwen3_coder"
       - "--language-model-only"    # Skip vision encoder — not needed for coding, frees VRAM for KV cache
+      - "--speculative-config"
+      - '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}'
       # NOTE: ngram speculative decoding (--spec-method ngram --spec-tokens 5) was
       # removed — on vLLM 0.22.1rc1 it crashed EngineCore with a KV-cache block
       # accounting assertion (num_required_blocks off by one) on large contexts.

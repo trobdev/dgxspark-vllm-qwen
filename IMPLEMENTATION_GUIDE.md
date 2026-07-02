@@ -592,19 +592,22 @@ alias claude-local='ANTHROPIC_BASE_URL=http://<dgx-ip>/coding \
 
 ### Connect Continue (VS Code / JetBrains)
 
-In `~/.continue/config.json`:
+In `~/.continue/config.yaml`:
 
-```json
-{
-  "models": [{
-    "title": "Qwen3.6 Coding (local)",
-    "provider": "openai",
-    "model": "coding",
-    "apiBase": "http://localhost/coding/v1",
-    "apiKey": "none"
-  }]
-}
+```yaml
+models:
+  - name: Qwen3.6 Coding (local)
+    provider: openai
+    model: coding
+    apiBase: http://<dgx-ip>/coding/v1
+    apiKey: none
+    systemMessage: "/no_think"
+    roles:
+      - chat
+      - edit
 ```
+
+The `systemMessage: "/no_think"` is required. The model reasons by default; vLLM extracts thinking tokens into a `reasoning_content` delta field that Continue's OpenAI adapter does not handle, producing a connection error. The `/no_think` directive suppresses reasoning for Continue's requests. The `apiBase` must use port 80 (the nginx path) — the vLLM debug port `:8001` is bound to loopback only and is not reachable from a remote client.
 
 ---
 

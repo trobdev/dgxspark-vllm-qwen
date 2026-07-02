@@ -153,6 +153,8 @@ Point at the OpenAI-compatible endpoint:
 
 Model name: `coding`, API key: `none`.
 
+> **Continue.dev:** Also add `systemMessage: "/no_think"` to your model entry in `~/.continue/config.yaml`. The model reasons by default and Continue's OpenAI adapter cannot handle the `reasoning_content` delta field vLLM emits for thinking tokens — the directive suppresses it.
+
 ---
 
 ## Day-to-day operations
