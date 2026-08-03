@@ -7,6 +7,24 @@ NVIDIA NVFP4 checkpoint to the unsloth NVFP4 checkpoint with calibrated KV-cache
 
 ---
 
+---
+
+## ⛔ Hard constraint — no driver updates
+
+**Never perform a GPU driver update as part of this work.** If any step turns out to
+require a driver newer than the current **`580.159.03`**, **stop and alert the operator.**
+Do not attempt a workaround, a partial upgrade, or a container-side shim to dodge it.
+Driver updates are performed by the machine's owner only, and an in-progress migration is
+not a reason to proceed.
+
+This is a live risk for v2, not a theoretical one: the build pulls
+`nvidia/cuda:13.2.0-devel-ubuntu24.04` and `torch` (upstream has moved to `2.11.0`). A
+CUDA or torch bump that outruns the installed driver is exactly the failure mode to watch
+for. Check compatibility **before** building, and treat any "driver too old" error as a
+full stop.
+
+---
+
 ## 0. Why
 
 Three independent wins motivate this, in rough order of value:
@@ -29,7 +47,12 @@ see [Deferred](#7-deferred-explicitly-not-in-v2).
 
 ---
 
-## 1. Rollback plan — do this first
+## 1. Rollback plan — ✅ COMPLETED 2026-08-03
+
+> Artifacts live in `~/llm-stack-backups/` (**not** `/data`, which is root-owned).
+> See `~/llm-stack-backups/RESTORE.md` for the restore runbook.
+> The image export is uncompressed (19 GB) rather than gzipped — disk is abundant
+> (2.8 TB free) and it avoids a slow ARM compression pass.
 
 > **The current image exists nowhere but this machine.** `vllm-node:latest` was built
 > locally and never pushed to a registry (`RepoDigests` is empty). A rebuild reuses the
@@ -60,15 +83,15 @@ docker tag vllm-node:latest vllm-node:v1-0.22.1rc1
 # 2. Offline copy that survives `docker system prune`
 #    (there is currently 35 GB reclaimable + 49 GB build cache, so a prune is plausible
 #     during this work — an untagged image would not survive it)
-mkdir -p /data/backups
-docker save vllm-node:v1-0.22.1rc1 | gzip > /data/backups/vllm-node-v1-0.22.1rc1.tar.gz
+mkdir -p ~/llm-stack-backups
+docker save vllm-node:v1-0.22.1rc1 | gzip > ~/llm-stack-backups/vllm-node-v1-0.22.1rc1.tar.gz
 
 # 3. The exact wheels that built the current image (~1.16 GB).
 #    build-and-copy.sh's try_download_wheels() writes into ./wheels/ and can clobber these.
-cp -a ~/spark-vllm-docker/wheels /data/backups/wheels-v1-0.22.1rc1
+cp -a ~/spark-vllm-docker/wheels ~/llm-stack-backups/wheels-v1-0.22.1rc1
 
 # 4. Local Dockerfile modifications — UNCOMMITTED, would be lost/conflicted by `git pull`
-cd ~/spark-vllm-docker && git diff > /data/backups/spark-vllm-docker-local-mods.patch
+cd ~/spark-vllm-docker && git diff > ~/llm-stack-backups/spark-vllm-docker-local-mods.patch
 
 # 5. Commit the pending compose changes on the stack repo
 cd ~/llm-stack && git add docker-compose.yml && git commit -m "..."
@@ -89,7 +112,7 @@ docker compose up -d
 ```
 
 If the local image was pruned:
-`gunzip -c /data/backups/vllm-node-v1-0.22.1rc1.tar.gz | docker load` first.
+`gunzip -c ~/llm-stack-backups/vllm-node-v1-0.22.1rc1.tar.gz | docker load` first.
 
 **Time to roll back: ~6 minutes** (dominated by model reload).
 
