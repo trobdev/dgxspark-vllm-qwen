@@ -300,13 +300,40 @@ Run after **each** phase (A and B), against the previous phase's numbers:
 
 ## 7. Deferred — explicitly not in v2
 
-- **Native NVFP4 compute** (FlashInfer b12x, vLLM PR #40082, merged 2026-05-20). Upstream
-  has an experimental `b12x` branch with an `--exp-b12x` flag. Deferred because: (a) the
-  NVIDIA developer forum reports Marlin still *outperforms* the native path on GB10 today;
-  (b) upstream's own maintained recipe for this model still specifies
-  `--moe-backend marlin`; (c) a maintainer flagged an unresolved correctness concern
-  (in-place mutation of a quantization scale tensor) during PR review. Revisit once the
-  recipe itself switches away from Marlin.
+- **Native NVFP4 compute** (`--moe-backend flashinfer_b12x`). **TESTED AND REJECTED for
+  Phase A on 2026-08-03** — see measurements below. Re-test in Phase B, because unsloth's
+  guidance describes *their* checkpoint, not NVIDIA's.
+
+  unsloth's model card states: *"do **NOT** use the Marlin backend since it's 2x slower -
+  use the native vLLM or cute-DSL / CUTLASS / flashinfer_trtllm backends!"*, and gives a
+  DGX Spark invocation of `CUTE_DSL_ARCH=sm_121a` + `--moe-backend flashinfer_b12x`,
+  citing 15,636 vs 8,721 tok/s.
+
+  The v2 image satisfies every prerequisite (vLLM `0.26.1rc1`, flashinfer-python `0.6.17`,
+  nvidia-cutlass-dsl `4.6.0`, `flashinfer_b12x` selectable), so this was measured directly
+  on the **NVIDIA** checkpoint, 300-token generations, identical harness:
+
+  | Concurrency | Marlin | flashinfer_b12x | Result |
+  |---|---|---|---|
+  | 1 | 118.5 tok/s | 122.1 tok/s | b12x +3% |
+  | 4 | **270.9 tok/s** | 215.0 tok/s | **Marlin +26%** |
+  | 8 | 377.8 tok/s | 374.6 tok/s | tie |
+
+  Batch-1, 500-token generation: Marlin 120.5/122.7/123.8 vs b12x 119.2/120.2/117.7.
+
+  **The 2x claim does not reproduce on this hardware with this checkpoint.** Output was
+  coherent under b12x (no UNK/garbage), so this is a performance finding, not a
+  correctness one. Marlin retained.
+
+  Caveats that keep this open for Phase B: (a) unsloth's recipe targets their own
+  mixed-precision NVFP4/FP8 layout, which may map to b12x differently than NVIDIA's;
+  (b) their 15k tok/s figure implies far higher concurrency than 8 — b12x may pull ahead
+  in a regime this stack never operates in; (c) a Marlin NVFP4 correctness bug on SM121
+  (negative-scale truncation → UNK tokens) is reported upstream but was **not** observed
+  here.
+
+  Exact working b12x config is preserved in a git stash (`b12x test config`) and is just:
+  env `CUTE_DSL_ARCH=sm_121a` + args `--moe-backend flashinfer_b12x`.
 - **Idle scale-down** via vLLM's `/sleep` + `/wake_up` (`--enable-sleep-mode`). Real and
   present in the current image, but gated behind `VLLM_SERVER_DEV_MODE=1`, needs a custom
   idle-watcher, and is untested against this Marlin + MTP + mamba-hybrid combination.
