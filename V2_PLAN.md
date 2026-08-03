@@ -12,16 +12,37 @@ NVIDIA NVFP4 checkpoint to the unsloth NVFP4 checkpoint with calibrated KV-cache
 ## ⛔ Hard constraint — no driver updates
 
 **Never perform a GPU driver update as part of this work.** If any step turns out to
-require a driver newer than the current **`580.159.03`**, **stop and alert the operator.**
-Do not attempt a workaround, a partial upgrade, or a container-side shim to dodge it.
-Driver updates are performed by the machine's owner only, and an in-progress migration is
-not a reason to proceed.
+require a driver newer than the currently installed **`580.173.02`**, **stop and alert the
+operator.** Do not attempt a workaround, a partial upgrade, or a container-side shim to
+dodge it. Driver updates are performed by the machine's owner only, and an in-progress
+migration is not a reason to proceed.
 
-This is a live risk for v2, not a theoretical one: the build pulls
-`nvidia/cuda:13.2.0-devel-ubuntu24.04` and `torch` (upstream has moved to `2.11.0`). A
-CUDA or torch bump that outruns the installed driver is exactly the failure mode to watch
-for. Check compatibility **before** building, and treat any "driver too old" error as a
-full stop.
+### Driver compatibility — ✅ VERIFIED GO (2026-08-03)
+
+This was the go/no-go gate. It clears, and by a comfortable margin — **v2 moves toward the
+installed driver, not away from it.**
+
+| Evidence | Finding |
+|---|---|
+| Upstream base image (`ARG CUDA_IMAGE`, Dockerfile line 5) | **`nvidia/cuda:13.0.2-devel-ubuntu24.04`** — *lower* than the `13.2.0` currently running |
+| Driver's natively supported CUDA (`nvidia-smi`) | **13.0** — exactly matches the v2 base image |
+| Upstream `torch==2.11.0` install index | **`cu130`** — same CUDA 13.0 target as the current `torch 2.10.0+cu130`. A PyTorch bump, not a CUDA bump. |
+| Current runtime proof | The running container already executes **CUDA 13.2** on this 580.x driver via forward compatibility (`cuda-compat-13-2`, `libcuda.so.595.45.04`, confirmed loaded by the live vLLM process). v2's 13.0.2 is strictly less demanding. |
+
+Installed driver: `580.173.02` (NVRM build 2026-06-23). Host userspace lib:
+`libcuda.so.580.173.02`.
+
+> Earlier revisions of this document cited `580.159.03`. That reading predated the
+> mid-July host reboots (kernel `6.17.0-1021-nvid` → `6.17.0-1026-nvid`), during which the
+> host updated itself. Both are 580.x and both natively support CUDA 13.0, so the
+> conclusion is unchanged.
+
+**Residual risk (cannot be pre-verified):** this establishes that the *declared* CUDA and
+torch targets need no driver update. It does not prove that some transitive dependency (a
+FlashInfer cubin, a specific CUTLASS DSL build) won't demand newer CUDA userspace at
+runtime. Such a failure surfaces **inside the container** as a CUDA-init or PTX error, not
+as a host problem. Response: stop and report — the forward-compat layer is the only
+sanctioned mitigation, never a host driver change.
 
 ---
 
@@ -150,7 +171,14 @@ Upstream is **~30 commits ahead** (`c187912..f7d6e3b`). Directly relevant:
 **Conflict to resolve:** local `Dockerfile` pins `torch==2.10.0+cu130`; upstream now uses
 `2.11.0`. Local also adds `--index-strategy unsafe-best-match` / `--extra-index-url` to
 the wheel install steps. Decide whether upstream's 2.11.0 works on GB10 before discarding
-the local pin — it was presumably pinned for a reason.
+the local pin — it was presumably pinned for a reason. (Both target `cu130`, so this is a
+functional question, not a driver-compatibility one.)
+
+**Structural change:** upstream's Dockerfile grew from 341 → 994 lines and now
+parameterizes the base image as `ARG CUDA_IMAGE`, defaulting to
+`nvidia/cuda:13.0.2-devel-ubuntu24.04` (down from the hardcoded `13.2.0` in the current
+build). Expect the local-mods patch to need manual reapplication rather than a clean
+`git apply` — the surrounding context has moved substantially.
 
 ### 3b. vLLM version
 
@@ -261,7 +289,8 @@ Run after **each** phase (A and B), against the previous phase's numbers:
 |---|---|---|
 | Dockerfile hardcodes a patch for vLLM PR #35568 ("broken FP8 kernels"). Likely merged by 0.26.0; if the diff applies cleanly in neither direction, `git apply -v` fails and the build dies. | **High** | Check whether #35568 is in 0.26.0 and remove the patch block before building |
 | Four minor versions of flag/API drift; `--language-model-only` unverified | **High** | Run `--help` in the new image *before* wiring it into compose |
-| torch 2.10.0 (local pin) vs 2.11.0 (upstream) | Med | Test upstream 2.11.0 first; local pin is the fallback (`spark-vllm-docker-local-mods.patch`) |
+| torch 2.10.0 (local pin) vs 2.11.0 (upstream) | Med | Test upstream 2.11.0 first; local pin is the fallback (`spark-vllm-docker-local-mods.patch`). **No driver implication** — both install from the `cu130` index. |
+| A transitive dep (FlashInfer cubin, CUTLASS DSL) demands newer CUDA userspace than the driver provides | Med | Surfaces inside the container, not on the host. **Stop and report** — never a host driver change. Forward-compat (`cuda-compat`) is the only sanctioned mitigation. |
 | MTP `--speculative-config` JSON shape may have changed | Med | Validate against 0.26.0 docs; `recipes/qwen3.6-35b-a3b-nvfp4-no-mtp.yaml` exists as a fallback |
 | anthropic-shim untested against 0.26.0's `/v1/messages` | Med | Covered by the validation checklist; shim is stdlib-only and easy to patch |
 | FP8 KV cache degrades quality subtly rather than loudly | Med | Phase B is separately reversible; long-context coherence check in §5 |
