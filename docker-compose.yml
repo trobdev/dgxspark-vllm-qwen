@@ -4,7 +4,11 @@ services:
 
   # ── Qwen3.6-35B-A3B-NVFP4 coding model ───────
   vllm-coding:
-    image: vllm-node:latest  # Built locally via eugr/spark-vllm-docker for DGX Spark driver 580.x — must be vLLM ≥0.19 for NVFP4 support
+    # Phase A (v2): vLLM 0.26.1rc1.dev247 / FlashInfer 0.6.17, built locally via
+    # eugr/spark-vllm-docker (f7d6e3b) with --use-wheels. Runs directly on driver
+    # 580.173.02 (torch 2.11.0+cu130, CUDA 13.0 — no compat layer needed).
+    # ROLLBACK: change this back to vllm-node:v1-0.22.1rc1 and `docker compose up -d`.
+    image: vllm-node-v2:latest
     container_name: vllm-coding
     runtime: nvidia
     restart: "no"
