@@ -95,8 +95,9 @@ the regime vendors benchmark in — which is why their numbers don't match yours
 
 ### Tier 5 — Kernel/scheduler tuning (small but real)
 
-- `--max-num-batched-tokens 8192`: **+7%** (101.3 -> 108.1 @ c=1). vLLM warns the implicit
-  2048 starves spec-decode draft slots. Always set this when speculation is on.
+- `--max-num-batched-tokens 8192`: gain **NOT established** — the observed 101.3 -> 108.1
+  sits exactly at the +-7% noise floor (see S8). Keep it anyway: vLLM explicitly warns the
+  implicit 2048 starves spec-decode draft slots, so it is the documented-correct setting.
 - MoE backend choice (Marlin vs `flashinfer_b12x`): **measured a wash** at c=1-8. Do not
   spend time here unless operating at high concurrency.
 
@@ -205,3 +206,32 @@ Both results can be correct simultaneously.
 - A larger-active-param model (A12B) will be ~4x slower per token regardless of tuning.
 - The biggest realistic wins available: smaller/leaner checkpoints, better speculation,
   and batching work when possible.
+
+
+---
+
+## 8. Measurement noise — read before trusting any delta
+
+Six consecutive runs of the **identical** config at c=1:
+
+```
+116.3  123.8  120.8  125.1  123.3  122.1    mean 121.9, spread ~ +-7%
+c=4:  278.9  286.5  283.6                   spread ~ +-2.7%
+```
+
+**Anything under ~10% at c=1 is not distinguishable with 3 trials.** Consequences for the
+results in this document:
+
+| Comparison | Delta | Verdict |
+|---|---|---|
+| MTP 3 vs 2 | +20% | Real |
+| MTP 3 vs 5 | +13% | Real |
+| ngram vs MTP=3 | -60% | Real |
+| NVIDIA vs unsloth -Fast | +14-15% | Real (both benchmarks agree) |
+| Marlin vs flashinfer_b12x | +3% | Noise |
+| qwen3_5_mtp vs mtp | +-8% | Noise |
+| --max-num-batched-tokens 8192 | +7% | **At the noise floor — not established** |
+
+**Method:** warm up first (the first run after a restart is 3-10x slower from JIT), run at
+least 5 trials for anything you intend to act on, and re-measure the baseline in the same
+session rather than comparing against a number from hours earlier.
