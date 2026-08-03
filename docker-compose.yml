@@ -23,12 +23,19 @@ services:
       - HF_TOKEN=${HF_TOKEN:-}
       - VLLM_LOGGING_LEVEL=WARNING
       - VLLM_TUNED_CONFIG_FOLDER=/moe-configs
+      # unsloth: MANDATORY on DGX Spark/GB10 for the cute-DSL b12x path
+      - CUTE_DSL_ARCH=sm_121a
     command:
       - "python3"
       - "-m"
       - "vllm.entrypoints.openai.api_server"
+      # Phase B: unsloth checkpoint. Genuine W4A4 NVFP4 (4-bit weights AND 4-bit
+      # activations, dynamic=local) — unlike nvidia/'s W4A16_NVFP4, which is
+      # weight-only and therefore CANNOT drive FP4 tensor cores on any GPU.
+      # Also ships calibrated k_scale/v_scale (10+10) enabling FP8 KV cache.
+      # ROLLBACK: change back to /models/Qwen3.6-35B-A3B-NVFP4
       - "--model"
-      - "/models/Qwen3.6-35B-A3B-NVFP4"
+      - "/models/Qwen3.6-35B-A3B-NVFP4-Fast"
       - "--served-model-name"
       - "coding"
       - "--host"
@@ -42,8 +49,20 @@ services:
       - "--tensor-parallel-size"
       - "1"
       - "--enable-prefix-caching"
+      # unsloth: mandatory on DGX Spark/GB10. Works on -Fast (all experts W4A4);
+      # would ERROR on the non-Fast variant, whose FP8 experts b12x cannot handle.
+      - "--moe-backend"
+      - "flashinfer_b12x"
+      # unsloth ships calibrated k_scale/v_scale (10+10), so FP8 KV cache does NOT
+      # silently clip (the reason it was rejected on the nvidia/ checkpoint).
+      - "--kv-cache-dtype"
+      - "fp8"
       - "--max-num-seqs"
       - "32"
+      # vLLM warns the implicit 2048 starves spec-decode draft slots;
+      # upstream recipe uses 8192.
+      - "--max-num-batched-tokens"
+      - "8192"
       - "--reasoning-parser"
       - "qwen3"
       - "--enable-auto-tool-choice"
