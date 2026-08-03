@@ -98,8 +98,20 @@ the regime vendors benchmark in — which is why their numbers don't match yours
 - `--max-num-batched-tokens 8192`: gain **NOT established** — the observed 101.3 -> 108.1
   sits exactly at the +-7% noise floor (see S8). Keep it anyway: vLLM explicitly warns the
   implicit 2048 starves spec-decode draft slots, so it is the documented-correct setting.
-- MoE backend choice (Marlin vs `flashinfer_b12x`): **measured a wash** at c=1-8. Do not
-  spend time here unless operating at high concurrency.
+- MoE backend choice: **no measurable difference**, tested properly on the checkpoint
+  unsloth's guidance targets (`-Fast`, W4A4), backend as the only variable, n=6:
+
+  | `-Fast` @ c=1 | mean | sd |
+  |---|---|---|
+  | `--moe-backend flashinfer_b12x` | 102.2 | 2.8 |
+  | auto-select | 104.1 | 1.7 |
+
+  +1.8% favouring auto, Welch t=1.26 — not significant; flips to -1.4% at c=4.
+  **Critically, auto also emits zero Marlin warnings** — vLLM 0.26.1 already selects a
+  native FP4 path for a W4A4 checkpoint on sm_121, so the explicit flag is redundant on
+  this build rather than wrong. unsloth's "mandatory on DGX Spark" guidance was correct
+  for older vLLM where sm_121 auto-selection failed. **Keep the flag anyway** — it costs
+  nothing and pins behaviour across future vLLM upgrades.
 
 ---
 
