@@ -60,18 +60,52 @@ Speed tracked size almost proportionally. Two sub-levers:
 ### Tier 2 — Tokens per forward pass (speculative decoding)
 
 Speculation multiplies output per weight-read. This is the main *algorithmic* lever on a
-memory-limited box. Measured sweep (`num_speculative_tokens`, aggregate tok/s @ c=1):
+memory-limited box, and the **single largest tunable win available: +45%**.
 
-```
-2 -> 90.2      3 -> 108.1      5 -> 95.2
-```
+Definitive sweep (2026-08-03) on Hermes-representative prompts — tool calls, code edits,
+prose, reasoning — median tok/s, n=5 (n=14 for the finalists):
 
-**3 is optimal here.** Acceptance falls 78.3% -> 64.7% going 3 -> 5, and the extra draft
-passes stop paying for themselves. Do not copy a vendor's default — sweep it.
+| draft len | 2 | 3 | **4** | 6 | 8 | 15 | mtp=3 | **none** |
+|---|---|---|---|---|---|---|---|---|
+| c=1 | 96.0 | 106.6 | **111.4** | 111.3 | 107.7 | 104.8 | 108.9 | **77.3** |
+| c=4 | 215.7 | 232.3 | **227.8** | 227.2 | 206.5 | 174.3 | 208.8 | **181.3** |
+| accept% | 70.8 | 61.6 | 53.1 | 41.9 | 33.0 | 18.7 | 65.0 | — |
 
-Important structural note: with `method: mtp` the **draft layer is unquantized BF16**, so
-each draft pass costs real bandwidth. Draft-free methods (see §4) may beat it on this
-platform precisely because they read *zero* extra weights.
+**Deployed: DFlash @ 4.** Four rules fall out of this table:
+
+1. **Do not copy the vendor default.** 15 (upstream's FP8 recipe) was the *worst* setting
+   tested and was **slower than no speculation at all at c=4** (174.3 vs 181.3). The
+   accepted-token count is roughly constant (~11K) at every draft length — everything past
+   ~3 tokens is pure verification waste.
+2. **There is an interior optimum, and it moves with concurrency.** c=1 peaks at 4-6; c=4
+   peaks at 3. Sweep both regimes, not just the one you think you run in.
+3. **Acceptance rate is a diagnostic, not an objective.** Draft length 2 has the *best*
+   acceptance (70.8%) and the *worst* c=1 throughput. Optimising acceptance is a trap.
+4. **Break ties on efficiency, not the point estimate.** 4 and 6 are statistically
+   identical (all |t| < 1.5, n=14). 4 wins on 53.1% vs 41.7% acceptance — same speed,
+   28% fewer draft tokens burned, lower variance.
+
+**DFlash vs MTP.** DFlash (`z-lab/Qwen3.6-35B-A3B-DFlash`, a separate 0.77 GB 6-layer
+dense draft model) beats MTP on structured output and loses slightly on free text —
+exactly the shape you'd predict, since speculation pays off when output is predictable:
+
+| workload | dflash4 | mtp3 | delta | Welch |
+|---|---|---|---|---|
+| tool_call | 120.9 | 112.8 | **+7.2%** | significant |
+| code_edit | 121.0 | 117.3 | **+3.2%** | significant |
+| prose | 99.5 | 103.1 | -3.5% | significant |
+| reasoning | 104.6 | 105.3 | -0.7% | not significant |
+| c=4 agg | 227.8 | 208.8 | **+9.1%** | significant |
+
+Agentic workloads are tool-call dominated, so this trade is favourable. **Pick the spec
+method to match your output distribution** — if the box were mainly writing prose, MTP
+would be the right choice.
+
+Structural notes: with `method: mtp` the draft layer is **unquantized BF16**, which is why
+its spec config must carry `"moe_backend":"triton"` — omitting it crashes EngineCore.
+DFlash needs no such flag. Draft-free (ngram) speculation **loses badly** (47.8 tok/s,
+17.2% acceptance): verification cost scales with draft length regardless of how the draft
+was produced, so reading "zero extra weights" does not save you.
 
 ### Tier 3 — Amortization (concurrency)
 
@@ -247,3 +281,20 @@ results in this document:
 **Method:** warm up first (the first run after a restart is 3-10x slower from JIT), run at
 least 5 trials for anything you intend to act on, and re-measure the baseline in the same
 session rather than comparing against a number from hours earlier.
+
+### 8.1 The noise floor is not instrument error (important correction)
+
+Running the **no-speculation** control produced spreads of **0.2-1.3%** across every
+workload. The measurement rig is therefore precise to ~1%; the +-7% band above is
+**acceptance-rate jitter intrinsic to speculative decoding**, not a limit on what can be
+resolved.
+
+Consequence: differences under 10% are *not* automatically unknowable — they are
+recoverable by raising n and testing the raw per-trial samples rather than eyeballing
+medians. The dflash-vs-mtp comparison (+7.2% on tool calls) was confirmed significant at
+n=14 by a Welch t-test, and would have been wrongly dismissed as noise under the old rule.
+
+**Revised rule:** treat <10% as *unresolved*, not *absent*. If the decision matters, run
+n>=14 and a two-sample test. Also benchmark on prompts resembling the real workload — the
+per-workload spread here (tool calls 121 vs prose 100 on the same config) is larger than
+most config deltas, so a single unrepresentative prompt can invert a conclusion.
