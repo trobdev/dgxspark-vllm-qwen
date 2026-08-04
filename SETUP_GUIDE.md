@@ -304,9 +304,12 @@ If you see a CUDA out-of-memory error, reduce the KV cache allocation:
 
 ```bash
 # In docker-compose.yml, under vllm-coding command, change:
-#   --max-model-len 65536        (down from 131072)
-# or:
-#   --gpu-memory-utilization 0.80  (down from 0.85)
+#   --gpu-memory-utilization 0.70  (down from 0.75)
+# or, only if that is not enough:
+#   --max-model-len 131072         (down from 262144)
+#
+# Prefer lowering utilization first: 262144 is set deliberately high because
+# Claude Code assumes a ~200K window and cannot be told the real one.
 
 docker compose up -d --force-recreate vllm-coding
 ```
@@ -314,7 +317,7 @@ docker compose up -d --force-recreate vllm-coding
 ### NVFP4 / Blackwell kernel errors on startup
 
 If vLLM fails to load the NVFP4 weights or reports unsupported quantization/kernel errors,
-your `vllm-node:latest` image predates NVFP4/Blackwell support. Rebuild it:
+your `vllm-node-v2:latest` image predates NVFP4/Blackwell support. Rebuild it:
 
 ```bash
 cd ~/spark-vllm-docker

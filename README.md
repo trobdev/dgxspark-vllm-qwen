@@ -11,8 +11,16 @@ shape (including `thinking` blocks) so no separate translation proxy is needed.
 OpenAI-compatible clients connect directly through Nginx — they bypass the shim entirely
 because vLLM speaks OpenAI natively.
 
-**Model:** `nvidia/Qwen3.6-35B-A3B-NVFP4` — 35B MoE (3B active), Blackwell NVFP4, 128K context, tool-calling.
+**Model:** `nvidia/Qwen3.6-35B-A3B-NVFP4` — 35B MoE (3B active), Blackwell NVFP4, 256K context, tool-calling,
+with DFlash speculative decoding (~111 tok/s single-stream, ~228 tok/s at 4 concurrent).
 The stack is model-agnostic; see [Swapping the model](#swapping-the-model) to use a different one.
+
+**Primary workload:** [Hermes Agent](OPTIMIZATION_REPORT.md), running on the host and
+connecting **straight to `localhost:8001`** over the OpenAI API — it bypasses Nginx and the
+shim, because it runs locally and speaks OpenAI natively, so there is nothing to proxy or
+translate. Claude Code and other network clients come in through Nginx. The tuning in
+[OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md) was driven by Hermes' traffic shape:
+tool-call and code-edit heavy, which is what selected DFlash speculative decoding.
 
 ## Documentation
 
@@ -21,12 +29,15 @@ The stack is model-agnostic; see [Swapping the model](#swapping-the-model) to us
 | **README.md** (this file) | Quick start, API access, day-to-day operations |
 | [SETUP_GUIDE.md](SETUP_GUIDE.md) | End-to-end setup from a fresh DGX Spark (Docker, NVIDIA toolkit, vLLM image build) |
 | [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) | The "why" — architecture, design decisions, and the reasoning behind each config choice |
+| [OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md) | What was tested, how it was measured, results, and why each setting was chosen |
+| [PERFORMANCE_PLAYBOOK.md](PERFORMANCE_PLAYBOOK.md) | Ranked tuning levers, negative results, and how to evaluate a new model |
+| [bench/](bench/) | Benchmark harness, config sweeper, and the functional validation suite |
 
 ## Prerequisites
 
 - Docker Engine with the NVIDIA Container Toolkit installed and the runtime configured
-- `vllm-node:latest` image built locally (see SETUP_GUIDE.md — must be vLLM ≥ 0.19 for NVFP4)
-- ~30 GB of free disk space for model weights
+- `vllm-node-v2:latest` image built locally (see SETUP_GUIDE.md — must be vLLM ≥ 0.19 for NVFP4)
+- ~30 GB of free disk space for model weights (22 GB target model + 0.8 GB DFlash draft model)
 
 > On a stock **DGX Spark**, Docker Engine and the NVIDIA Container Toolkit/runtime are
 > preinstalled and configured out of the box — the first bullet is already done. See
@@ -173,17 +184,28 @@ Model name: `coding`, API key: `none`.
 
 ## GPU memory
 
-With `--gpu-memory-utilization 0.85` vLLM commits ~108 GB of the 128 GB pool,
+With `--gpu-memory-utilization 0.75` vLLM commits ~91 GiB of the ~121 GiB usable pool,
 leaving the rest as headroom:
 
-| Allocation        | Approx size  |
-|-------------------|--------------|
-| NVFP4 weights     | ~22 GB       |
-| KV cache (128K)   | ~87 GB       |
-| Free headroom     | ~19 GB       |
+| Allocation                | Approx size  |
+|---------------------------|--------------|
+| NVFP4 weights             | 21.9 GiB     |
+| DFlash draft model        | 0.7 GiB      |
+| KV cache + activations    | 68.6 GiB     |
+| Free headroom             | ~30 GiB      |
 
-If the model OOMs on startup, reduce `--max-model-len` to `65536` or lower
-`--gpu-memory-utilization` to `0.80` in `docker-compose.yml`.
+Measured live at 93,381 MiB. vLLM reports a KV pool of 2,453,340 tokens — about
+**9 concurrent sequences at the full 256K context**, proportionally more at shorter ones.
+
+**Why 0.75 rather than higher:** this is unified memory, shared with the OS and every other
+process, and host usage grows over days of uptime. At 0.85 the box sat at ~122 GB of 128 GB
+with no margin. Utilization buys KV capacity, **not throughput**, so the headroom is free in
+tokens/second terms.
+
+If the model OOMs on startup, lower `--gpu-memory-utilization` further before reducing
+`--max-model-len` — but see the note in
+[IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md#throughput-expectations-and-limitations)
+on why 262144 is set deliberately high for Claude Code.
 
 ---
 
@@ -207,12 +229,18 @@ single developer or a trusted LAN.
 
 1. Download new weights to `MODEL_PATH`
 2. Update `--model` and `--served-model-name` in `docker-compose.yml`
-3. `docker compose up -d --force-recreate vllm-coding`
+3. Remove or replace `--speculative-config` — the DFlash draft model is specific to
+   Qwen3.6 and will not work with another model
+4. Drop `--reasoning-parser` / `--tool-call-parser` if the new model doesn't use Qwen3's formats
+5. `docker compose up -d --force-recreate vllm-coding`
+6. Re-sweep `num_speculative_tokens` if you add a draft model — see
+   [PERFORMANCE_PLAYBOOK.md](PERFORMANCE_PLAYBOOK.md)
 
 ---
 
 ## Important: vLLM image requirement
 
 NVFP4 quantization on the GB10 Blackwell architecture requires **vLLM ≥ 0.19**.
-The `vllm-node:latest` image must be rebuilt from `eugr/spark-vllm-docker` if your existing
+The `vllm-node-v2:latest` image must be rebuilt from `eugr/spark-vllm-docker` if your existing
 build predates NVFP4 support. See [SETUP_GUIDE.md](SETUP_GUIDE.md) for rebuild instructions.
+The deployed build is `0.26.1rc1.dev247+ge92dc7a9c`.

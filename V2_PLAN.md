@@ -1,5 +1,26 @@
 # v2 Rebuild Plan — vLLM 0.26.x + unsloth NVFP4
 
+> **STATUS: COMPLETE — 2026-08-03.** This document is the *plan* and is kept as a
+> historical record; do not read it as a description of the deployed stack.
+>
+> **Outcome differs from the plan in one significant way: the unsloth checkpoint was
+> tested and rejected.** Phase A (the vLLM 0.26.1rc1 upgrade) shipped as designed. Phase B
+> (the checkpoint swap) was executed, benchmarked tuned-vs-tuned, and reverted — the
+> `nvidia/` checkpoint is ~16% faster on this hardware because at concurrency 1–8 the box
+> is bandwidth-bound and the unsloth checkpoint is 3 GB larger. Native FP4 was confirmed
+> *reachable* (the W4A16 vs W4A4 question is answered: yes, with a W4A4 checkpoint) but
+> measured to be worth nothing here.
+>
+> The real gain came from somewhere the plan did not anticipate: **tuning speculative
+> decoding**, worth +44%.
+>
+> - Deployed configuration and reasoning: [`docker-compose.yml`](docker-compose.yml)
+> - What was tested, how, and why: [`OPTIMIZATION_REPORT.md`](OPTIMIZATION_REPORT.md)
+> - Ranked levers and negative results: [`PERFORMANCE_PLAYBOOK.md`](PERFORMANCE_PLAYBOOK.md)
+>
+> The rollback plan in §1 remains valid and the preserved artifacts are still on disk.
+
+
 **Status:** scoped, not started
 **Scoped:** 2026-08-03
 **Goal:** move the stack from vLLM `0.22.1rc1.dev` to `0.26.x`, and (separately) from the

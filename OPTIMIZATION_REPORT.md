@@ -194,7 +194,9 @@ for the same accepted output. Same speed, 28% less wasted computation, lower var
 Two methods were viable: **MTP**, a multi-token-prediction head built into the checkpoint, and
 **DFlash**, a separate 0.77 GB 6-layer dense draft model.
 
-DFlash @ 4 vs MTP @ 3, n=14, Welch t-test on raw trials:
+DFlash @ 4 vs MTP @ 3, n=14. Figures are **means**, since that is what the Welch t-test
+compares; the medians in §5.1 differ slightly and are the right statistic for the headline
+throughput numbers:
 
 | workload | DFlash | MTP | delta | significant? |
 |---|---|---|---|---|
@@ -345,53 +347,3 @@ negative results, upgrade evaluation procedure) and **`V2_PLAN.md`** (rollback p
 risk register).
 
 ---
-
-## Appendix: draft LinkedIn post
-
-> **I spent a day optimizing a 35B model on a desktop AI box. Almost everything I expected to
-> matter didn't.**
->
-> The setup: Qwen3.6-35B (a mixture-of-experts model, ~3B active parameters) running locally on
-> a 128 GB GB10 machine, serving an agent that handles scheduling, small builds, and writing.
->
-> I went in expecting the wins to come from the interesting hardware: 4-bit tensor cores,
-> optimized MoE kernels, a community checkpoint specifically quantized to use them.
->
-> Here's what actually happened.
->
-> **Native FP4 tensor cores: no measurable gain.** Neither did the recommended kernel backend
-> (Welch t = 1.26 — noise). One bandwidth calculation explained why, and would have predicted
-> it before I started: at low concurrency this machine is memory-bound. It reads ~0.9 GB of
-> weights per token against a 273 GB/s ceiling and runs at roughly a quarter of peak. The
-> arithmetic units are already idle. Making multiplication faster optimizes a resource nobody
-> is waiting on. A sustained run showed 93% "GPU utilization" at 26.7 watts — stalled, not busy.
->
-> **The specialized checkpoint ran 16% SLOWER.** It uses a genuinely better quantization
-> scheme. It's also 3 GB bigger, and on a bandwidth-bound machine, size is speed. Worth saying
-> clearly: the vendor isn't wrong. Their benchmarks are on a B200 at 128 concurrent requests —
-> ~29x the memory bandwidth, a compute-bound regime where their approach wins decisively. Two
-> correct benchmarks, two different machines.
->
-> **The actual win was speculative decoding — worth +44%.** And the parameter I'd copied
-> straight from the vendor's recipe was the worst value I tested. At 4 concurrent requests it
-> was slower than turning the feature off entirely. Sweeping it properly: +6% single-stream,
-> +31% under concurrency, and 28% less wasted computation.
->
-> **The most useful finding was about method, not hardware.** I'd been treating a ±7% variance
-> band as my measurement noise floor and discarding smaller differences as unknowable. Then I
-> ran a control with the feature disabled — variance collapsed to 0.2%. That band wasn't
-> instrument error; it was jitter from the thing I was measuring. My "noise floor" would have
-> caused me to throw away the result that decided the final configuration.
->
-> Three things I'd take to any similar project:
->
-> → Work out which resource you're short of *before* optimizing. One back-of-envelope
-> calculation predicted every null result here.
-> → Benchmark on prompts that look like your real workload. The gap between my tool-call
-> prompts and my prose prompts was bigger than almost every setting I tested.
-> → Run a control before you trust your own error bars.
->
-> Full write-up and the benchmark harness are in the repo. Happy to talk shop if you're doing
-> similar work on local inference.
->
-> #LocalLLM #MachineLearning #Inference #vLLM #Performance
