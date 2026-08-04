@@ -12,9 +12,23 @@ Interactive single-stream decode on a sparse MoE is dominated by **how many byte
 read to produce one token**, not by how fast the GPU can multiply. Your GB10 has ~273 GB/s
 of unified memory bandwidth and FP4 tensor cores. The FP4 tensor cores are largely
 irrelevant to you, because you are never waiting on math. **But you are also not at the
-bandwidth ceiling** — measured effective throughput is ~11% of theoretical, so the binding
-constraint at batch-1 is memory *access efficiency* (scattered MoE expert gathers, skinny
-batch-1 GEMMs, per-layer kernel overhead), not raw bandwidth.
+bandwidth ceiling** — so the binding constraint at batch-1 is memory *access efficiency*
+(scattered MoE expert gathers, skinny batch-1 GEMMs, per-layer kernel overhead), not raw
+bandwidth.
+
+Quantify it carefully, because there are two correct numbers and quoting the wrong one will
+mislead you. Weights are read **once per target-model forward pass**, no matter how many
+candidate tokens that pass verifies — so bandwidth use tracks *forward passes*, not tokens/s.
+At an estimated ~0.9 GB of weights per pass:
+
+| config | forward passes/s | implied GB/s | % of 273 GB/s |
+|---|---|---|---|
+| no speculative decoding | 77.3 | ~70 | **~25%** |
+| DFlash @ 4 (deployed) | ~36 | ~32 | **~12%** |
+
+**Speculation *lowers* bandwidth utilisation** — it extracts ~3.1 tokens per weight-read
+instead of 1. That is not waste; it is exactly why it is the winning lever on this box, and
+why the headroom below the ceiling is not something to "use up".
 
 ---
 
@@ -22,7 +36,7 @@ batch-1 GEMMs, per-layer kernel overhead), not raw bandwidth.
 
 | Limit | Value | Consequence |
 |---|---|---|
-| Unified memory bandwidth | ~273 GB/s | Hard ceiling on weight streaming. Not currently binding (we use ~11%). |
+| Unified memory bandwidth | ~273 GB/s | Hard ceiling on weight streaming. Not currently binding: ~25% used without speculation, ~12% with it (see §0). |
 | Unified memory capacity | 128 GB (121 GiB usable) | Caps model size + KV cache + host processes combined. CPU and GPU share one pool. |
 | Single GPU | 1x GB10 | No tensor parallelism without a second box. `--tensor-parallel-size 1` is forced. |
 | Compute capability | sm_121 | Consumer/workstation Blackwell. Upstream kernel coverage (CUTLASS/FlashInfer/TRT-LLM) frequently gates on `family(100)` and excludes sm_12x. Partially mitigated by newer builds — see §5. |
@@ -160,27 +174,43 @@ the regime vendors benchmark in — which is why their numbers don't match yours
 
 ---
 
-## 4. Untested levers, highest-expected-value first
+## 4. Open levers — and what closed since this was written
 
-These are the concrete open opportunities as of 2026-08-03:
+Three of the five items originally listed here have been resolved. Kept with their outcomes,
+because a lever that was tried and lost is more useful to a future reader than a blank space.
 
-1. **The MoE tuning config has never loaded.** vLLM logs on every start:
-   `Using default MoE config. Performance might be sub-optimal! Config file not found at
-   /moe-configs/E=256,N=512,device_name=NVIDIA_GB10.json`. The mounted file has extra
-   `dtype=`/`block_shape=` suffixes and does not match the expected name. Given the ~11%
-   bandwidth efficiency, kernel tile selection is a plausible contributor. **Cheapest
-   untested lever.**
-2. **Draft-free speculation.** vLLM 0.26.1 offers `ngram`, `ngram_gpu`, and `suffix`.
-   These read **no extra weights**, unlike MTP's BF16 draft layer — structurally
-   attractive on a bandwidth-limited box, and coding workloads are highly repetitive
-   (ideal for n-gram/suffix matching). Note: ngram crashed on vLLM 0.22.1rc1; that was
-   four versions ago and is worth retrying.
-3. **`qwen3_5_mtp` instead of generic `mtp`.** A model-family-specific MTP implementation
-   exists for this architecture; we use the generic path.
-4. **`dflash`.** Upstream ships `recipes/qwen3.6-35b-a3b-fp8-dflash.yaml`, so it is
-   considered viable for this model family.
-5. **CUDA graph / compilation coverage.** At ~36 forward passes/sec across 40 layers,
-   per-kernel launch overhead is worth profiling before assuming it's negligible.
+**Closed:**
+
+1. ~~**The MoE tuning config has never loaded.**~~ **RESOLVED — removed.** vLLM logged
+   `Using default MoE config. Performance might be sub-optimal!` on every start because the
+   mounted file's name carries `dtype=fp8_w8a8` and this model is NVFP4, so the key never
+   matched. Renaming it to what vLLM looks for made it load and immediately crash:
+   `triton.runtime.errors.OutOfResources: shared memory, Required: 294912, Hardware limit:
+   101376` — it was tuned for a GPU with ~3x GB10's shared memory per SM. **The filename
+   mismatch had been silently protecting the stack.** The mount and
+   `VLLM_TUNED_CONFIG_FOLDER` were removed; leaving them was a latent crash if a future vLLM
+   loosened its matching rules. To pursue this properly, generate a config with
+   `benchmark_moe.py` against *this* GPU and *this* dtype.
+2. ~~**Draft-free speculation.**~~ **RESOLVED — lost badly.** `ngram` scored **47.8 tok/s at
+   17.2% acceptance** against 123.7 for a real draft model. The structural argument ("reads
+   no extra weights, so it must win on a bandwidth-limited box") is **wrong**: verification
+   cost scales with draft length regardless of how the draft was produced, and a draft that
+   is rarely accepted pays that cost for nothing. Do not revisit on this reasoning alone.
+3. ~~**`qwen3_5_mtp` instead of generic `mtp`.**~~ **RESOLVED — no difference** (+-8%, inside
+   the noise band; see §8).
+4. ~~**`dflash`.**~~ **RESOLVED — adopted, and it is the largest win in the stack.** Deployed
+   at `num_speculative_tokens: 4`. See §2 Tier 2 for the full sweep and the DFlash-vs-MTP
+   comparison.
+
+**Still open:**
+
+5. **CUDA graph / compilation coverage.** At ~36 target-model forward passes/sec across 40
+   layers, per-kernel launch overhead is worth profiling before assuming it is negligible.
+   This is now the *only* untested lever from the original list, and the most plausible
+   remaining explanation for the gap between ~12% bandwidth utilisation and the ceiling.
+6. **MoE gather efficiency.** Follows from §0: the binding constraint is access pattern, not
+   raw bandwidth. Anything that improves expert-gather locality at batch-1 attacks the actual
+   bottleneck. No concrete lever identified yet — flagged as the right *direction*.
 
 ---
 
@@ -244,14 +274,19 @@ Both results can be correct simultaneously.
 
 ## 7. Realistic expectations
 
-- Current: **~117-124 tok/s** batch-1, ~365 tok/s aggregate at c=8, on a 22 GB / 3B-active
-  FP4 MoE.
-- Theoretical bandwidth ceiling: ~330 forward passes/sec; we achieve ~36. The gap is MoE
-  gather inefficiency + batch-1 GEMM shape + kernel overhead. **Some is recoverable
-  (§4), much is inherent to sparse MoE at batch-1.**
+- Current, on Hermes-representative prompts (n=14, DFlash @ 4): **111.4 tok/s** at c=1 and
+  **227.8 tok/s** aggregate at c=4, on a 22 GB / 3B-active FP4 MoE. Without speculation,
+  77.3 and 181.3.
+- **Expect a ~20% spread across workload types on identical settings** — 121 tok/s on code
+  edits vs 100 on novel prose. Quote a range, not a single number, and say what it was
+  measured on.
+- Theoretical bandwidth ceiling: ~330 forward passes/sec; we achieve ~36 with speculation
+  (~77 without). The gap is MoE gather inefficiency + batch-1 GEMM shape + kernel overhead.
+  **Some may be recoverable (§4), much is inherent to sparse MoE at batch-1.**
 - A larger-active-param model (A12B) will be ~4x slower per token regardless of tuning.
 - The biggest realistic wins available: smaller/leaner checkpoints, better speculation,
-  and batching work when possible.
+  and batching work when possible. Note the first two are the *same* lever in disguise —
+  both reduce bytes read per token produced.
 
 
 ---

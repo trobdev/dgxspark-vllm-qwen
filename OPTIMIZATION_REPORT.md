@@ -53,6 +53,13 @@ what gets touched per token — active experts across 40 layers, attention proje
 At the measured no-speculation rate of 77.3 tok/s, that is approximately **70 GB/s against a
 ~273 GB/s ceiling — around a quarter of peak.**
 
+One subtlety worth stating, because it inverts the intuition: weights are read **once per
+target-model forward pass**, however many candidate tokens that pass verifies. So with
+speculative decoding enabled the deployed config runs ~36 forward passes/sec (111.4 tok/s at
+~3.1 tokens per pass) and uses only **~12%** of peak bandwidth. **Speculation *lowers*
+bandwidth utilisation.** That is the point — it buys more tokens per weight-read rather than
+reading faster, which is the only thing that helps when the reads are the constraint.
+
 Two consequences drive the entire report:
 
 1. **The machine is memory-bound, not compute-bound, at concurrency 1–8.** The arithmetic
