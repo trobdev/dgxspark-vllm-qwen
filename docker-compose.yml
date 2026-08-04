@@ -4,7 +4,11 @@ services:
 
   # ── Qwen3.6-35B-A3B-NVFP4 coding model ───────
   vllm-coding:
-    image: vllm-node:latest  # Built locally via eugr/spark-vllm-docker for DGX Spark driver 580.x — must be vLLM ≥0.19 for NVFP4 support
+    # Phase A (v2): vLLM 0.26.1rc1.dev247 / FlashInfer 0.6.17, built locally via
+    # eugr/spark-vllm-docker (f7d6e3b) with --use-wheels. Runs directly on driver
+    # 580.173.02 (torch 2.11.0+cu130, CUDA 13.0 — no compat layer needed).
+    # ROLLBACK: change this back to vllm-node:v1-0.22.1rc1 and `docker compose up -d`.
+    image: vllm-node-v2:latest
     container_name: vllm-coding
     runtime: nvidia
     restart: "no"
@@ -13,16 +17,27 @@ services:
     volumes:
       - models:/models
       - huggingface-cache:/root/.cache/huggingface
-      - ./moe-configs:/moe-configs:ro
+      # NOTE: ./moe-configs is intentionally NOT mounted. The only file there is
+      # E=256,N=512,...,dtype=fp8_w8a8 — tuned for the FP8 checkpoint, not NVFP4.
+      # It never applied (dtype mismatch), and forcing it to match crashed Triton
+      # with OutOfResources (shared memory 294912 required vs 101376 limit).
+      # Mounting it is a latent hazard if a future vLLM loosens its matching rules.
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - HF_TOKEN=${HF_TOKEN:-}
       - VLLM_LOGGING_LEVEL=WARNING
-      - VLLM_TUNED_CONFIG_FOLDER=/moe-configs
+      # CUTE_DSL_ARCH=sm_121a was required only for unsloth's cute-DSL b12x path.
+      # That checkpoint was benchmarked and rejected (~16% slower here), so the
+      # var is inert. See PERFORMANCE_PLAYBOOK.md §3.
     command:
       - "python3"
       - "-m"
       - "vllm.entrypoints.openai.api_server"
+      # Checkpoint choice (benchmarked 2026-08-03, tuned-vs-tuned): the nvidia/
+      # W4A16_NVFP4 checkpoint + Marlin beats unsloth's W4A4 + native FP4 by ~16%
+      # here. This box is bandwidth-bound at concurrency 1-8, so bytes/token wins
+      # and FP4 tensor cores buy nothing. unsloth's only real edge is a working
+      # FP8 KV cache (2x KV capacity) — revisit only if KV becomes binding.
       - "--model"
       - "/models/Qwen3.6-35B-A3B-NVFP4"
       - "--served-model-name"
@@ -40,18 +55,39 @@ services:
       - "--enable-prefix-caching"
       - "--max-num-seqs"
       - "32"
+      # vLLM warns the implicit 2048 starves spec-decode draft slots;
+      # upstream recipe uses 8192.
+      - "--max-num-batched-tokens"
+      - "8192"
       - "--reasoning-parser"
       - "qwen3"
       - "--enable-auto-tool-choice"
       - "--tool-call-parser"
       - "qwen3_coder"
       - "--language-model-only"    # Skip vision encoder — not needed for coding, frees VRAM for KV cache
+      # Speculative decoding: DFlash draft model, 4 draft tokens.
+      # Swept on Hermes-representative prompts (n=14/workload), median tok/s @ c=1:
+      #   draft len:   2      3      4      6      8     15    | mtp3  | none
+      #   c=1:      96.0  106.6  111.4  111.3  107.7  104.8    | 108.9 | 77.3
+      #   c=4:     215.7  232.3  227.8  227.2  206.5  174.3    | 208.8 | 181.3
+      # Spec decode overall is worth +45% at c=1. Draft length 4 and 6 tie within
+      # noise (all |t|<1.5); 4 is chosen because it hits the same throughput at
+      # 53.1% acceptance vs 41.7% — 28% fewer wasted draft tokens, lower variance.
+      # 15 (the upstream FP8 recipe's value) was the WORST setting tested and was
+      # actually slower than no speculation at all at c=4. Do not copy vendor
+      # defaults for this parameter.
+      # vs MTP: DFlash wins tool calls +7.2% and code edits +3.2% (both p<0.05)
+      # and c=4 by +9.1%; it loses prose by 3.5%. Hermes is tool-call dominated,
+      # so this trade is favourable. MTP rollback (needs the triton moe_backend
+      # because its draft layer is unquantized BF16):
+      #   '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}'
       - "--speculative-config"
-      - '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}'
-      # NOTE: ngram speculative decoding (--spec-method ngram --spec-tokens 5) was
-      # removed — on vLLM 0.22.1rc1 it crashed EngineCore with a KV-cache block
-      # accounting assertion (num_required_blocks off by one) on large contexts.
-      # Re-enable once on a vLLM release where that's fixed.
+      - '{"method":"dflash","model":"/models/Qwen3.6-35B-A3B-DFlash","num_speculative_tokens":4}'
+      # NOTE: ngram speculative decoding was removed — it crashed EngineCore on
+      # 0.22.1rc1, and when later retested scored 47.8 tok/s at 17.2% acceptance
+      # vs 123.7 for a real draft model. Draft-free speculation does NOT win on
+      # bandwidth-limited hardware: verification cost scales with draft length
+      # regardless of how the draft was produced.
     ports:
       # Direct vLLM port — bound to loopback only (debug/local use).
       # This bypasses Nginx, so it must NOT be reachable from the network:
@@ -68,7 +104,11 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 300s
+      # Measured cold-start across 10 container recreates (2026-08-03): 341-461s.
+      # The old 300s start_period + 5x30s retries = 450s of grace, which is BELOW
+      # an observed load time — a slow start would flip the container to unhealthy
+      # and stall nginx/anthropic-shim, both of which gate on service_healthy.
+      start_period: 600s
 
   # ── Anthropic normalizing shim ─────────────────
   # Claude Code injects a system-role message into messages[]; vLLM's native

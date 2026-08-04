@@ -11,53 +11,102 @@ The architecture here has one goal: make a 35-billion-parameter reasoning model 
 ## Architecture Overview
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                        CLIENTS                               │
-│  Claude Code / IDEs              curl / Continue / OpenAI    │
-│  (claude-local alias)            (compatible apps)           │
-└───────────────┬──────────────────────────┬───────────────────┘
-   :80 /coding (Anthropic)      :80 /coding/v1 (OpenAI)
-                └──────────────┬───────────┘
-                               ▼
-             ┌─────────────────────────────────────┐
-             │         Nginx  :80 / :443           │
-             │  /coding/v1/messages → shim:8080    │
-             │  /coding/other → vllm-coding:8000   │
-             │  (reverse proxy, streaming)         │
-             └───────────────────┬─────────────────┘
-                                 │
-             ┌─────────────────▼──────────────────┐
-             │  docker network: llm-net            │
-             │  ┌──────────┐  ┌────────────────┐  │
-             │  │  shim   │  │   vLLM — coding│  │
-             │  │ :8080   │  │   :8001        │  │
-             │  │ hoists   │  │ Qwen3.6-35B    │  │
-             │  │ system[] │  │ NVFP4 · 128K   │  │
-             │  └────┬─────┘  │ ctx · MoE     │  │
-             │       │        └────────────────┘  │
-             │       └──────────────┬─────────────┘
-             │                      │
-             │  shared vol: /data/models
-             └───────────────────┬─────────────────┘
-                                 │
-             ┌───────────────────▼─────────────────┐
-             │   NVIDIA Container Runtime           │
-             │   CUDA · NVFP4 · PagedAttention      │
-             └───────────────────┬─────────────────┘
-                                 │
-             ┌───────────────────▼─────────────────┐
-             │   DGX Spark — GB10 Grace Blackwell   │
-             │   128 GB unified · 273 GB/s          │
-             └─────────────────────────────────────┘
+  Hermes Agent            Claude Code / IDEs        curl / Continue
+  (PRIMARY, on-host)      (claude-local alias)      (OpenAI-compatible)
+  OpenAI API                     │                         │
+        │              :80 /coding (Anthropic)   :80 /coding/v1 (OpenAI)
+        │                        └───────────┬─────────────┘
+        │                                    ▼
+        │                    ┌───────────────────────────────────┐
+        │                    │        Nginx  :80 / :443          │
+        │                    │  /coding/v1/messages → shim:8080  │
+        │                    │  /coding/*           → vLLM:8000  │
+        │                    └────────┬────────────────┬─────────┘
+        │                             ▼                │
+        │                  ┌─────────────────────┐     │
+        │                  │  anthropic-shim     │     │
+        │                  │  hoists system[]    │     │
+        │                  └──────────┬──────────┘     │
+        │  :8001 direct               │                │
+        │  bypasses Nginx + shim      ▼                ▼
+        └──────────────────►┌──────────────────────────────────┐
+                            │  vLLM — coding                   │
+                            │  Qwen3.6-35B-A3B-NVFP4 · 256K    │
+                            │  DFlash spec decode (4)          │
+                            │  111 tok/s c=1 · 228 tok/s c=4   │
+                            └────────────────┬─────────────────┘
+                                             ▼
+                            ┌──────────────────────────────────┐
+                            │  NVIDIA container runtime        │
+                            │  CUDA · Marlin · PagedAttention  │
+                            └────────────────┬─────────────────┘
+                                             ▼
+                            ┌──────────────────────────────────┐
+                            │  GB10 Grace Blackwell            │
+                            │  128 GB unified · 273 GB/s       │
+                            │  memory-bound at concurrency 1–8 │
+                            └──────────────────────────────────┘
 ```
 
-### GPU Memory Budget (128 GB, gpu_util = 0.85 → ~108 GB committed)
+### GPU Memory Budget (~121 GiB usable, gpu_util = 0.75 → ~91 GiB committed)
 
 ```
-[████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]
- 17%  ~22 GB       68%  ~87 GB KV cache              15% free
- NVFP4 weights     (PagedAttention pool)              ~19 GB
+[███████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]
+ 19%  22.6 GiB     57%  68.6 GiB KV + activations    25% free
+ NVFP4 weights     (PagedAttention pool)             ~30 GiB
+ (21.9 main +
+  0.7 draft)
 ```
+
+Measured live: `nvidia-smi` reports **93,381 MiB (91.2 GiB)** for `VLLM::EngineCore`. vLLM's
+own `cache_config_info` metric reports a KV pool of **2,453,340 tokens** and
+**`kv_cache_max_concurrency` = 9.36** — that is, room for roughly nine simultaneous
+sequences at the full 262144-token context.
+
+> **Why 0.75 and not a higher fraction.** Utilization was lowered from 0.85 deliberately.
+> This is a unified-memory machine: the same pool serves the OS, Docker, and every other
+> process on the box, and its consumption grows over days of uptime. At 0.85 the host sat at
+> ~122 GB of 128 GB, leaving no margin for a slow leak elsewhere to avoid an OOM. Utilization
+> buys KV capacity, **not throughput** — so the ~30 GiB given up here costs nothing in
+> tokens/second and buys the ability to leave the box running unattended.
+
+### Clients — and why Hermes takes a different path
+
+Three kinds of client reach this stack, and they do not all go through the front door.
+
+**Hermes Agent is the primary workload**, and it is the reason the tuning in
+[OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md) was done at all. It runs a general personal
+assistant, a small project builder, and content development. It connects **directly to
+`http://localhost:8001/v1`** — vLLM's published loopback port — using the OpenAI API, and
+**bypasses both Nginx and the shim.**
+
+That is deliberate, not an oversight. Nginx exists to terminate network traffic and to route
+Anthropic-format requests to the normalizing shim. Hermes needs neither: it runs on the same
+host, so there is nothing to reverse-proxy, and it speaks the OpenAI API natively, so there
+is nothing to normalize. Routing it through Nginx would add two process hops per request for
+no benefit.
+
+Two consequences worth stating explicitly:
+
+- **Port 8001 must stay bound to `127.0.0.1`.** It is unauthenticated and unencrypted.
+  Because Hermes depends on it, it is tempting to "just expose it" for a second machine —
+  don't. Anything that can reach it gets unrestricted use of the model and sees every prompt.
+  A remote client should go through Nginx and get an auth check added first.
+- **Hermes reads the real context window from `/v1/models`.** This is the opposite of Claude
+  Code, which assumes ~200K for any custom endpoint and cannot be told otherwise — the
+  problem that forced `--max-model-len 262144`. A client that probes adapts to whatever the
+  server offers; a client that assumes constrains the server's configuration.
+
+**Availability.** `restart: "no"` is intentional (see the risk table) so that a crash stays
+visible instead of silently restart-looping. To stop that from leaving the assistant with no
+model, Hermes is configured with an **AWS Bedrock fallback provider**, which fires only on
+rate-limit, overload, or connection failure against the local stack. It is billed per token,
+so it should stay a genuine fallback rather than a routine path.
+
+**Why the workload shape mattered.** Hermes traffic is dominated by structured tool calls and
+file edits rather than free-form prose. That single fact selected the speculative decoding
+method: DFlash wins on predictable output and loses slightly on novel text. A prose-heavy
+deployment on identical hardware should make the opposite choice.
 
 ---
 
@@ -67,14 +116,19 @@ Traditional GPU-based inference has a hard constraint: model weights must fit in
 
 The DGX Spark's GB10 Grace Blackwell changes this with unified memory. The CPU and GPU do not have separate memory pools — there is a single 128 GB pool addressed by both. This is not a software trick like CPU offloading (which shuttles weights across PCIe); it is the hardware architecture, and the GPU's tensor cores address the entire 128 GB directly.
 
-The advantage here is **capacity, not raw bandwidth.** The unified pool runs at ~273 GB/s (LPDDR5X) — modest next to a discrete GPU's VRAM (an H100 moves >3 TB/s). What the Spark buys you is the ability to hold a 35B model *and* a large KV cache in one pool at all, on a single device, without the multi-GPU rack that capacity would otherwise demand. You trade peak throughput for the fact that the workload fits — which is why generation lands at ~100–110 tokens/second (see [Throughput Expectations](#throughput-expectations-and-limitations)) rather than cloud-cluster speeds.
+The advantage here is **capacity, not raw bandwidth.** The unified pool runs at ~273 GB/s (LPDDR5X) — modest next to a discrete GPU's VRAM (an H100 moves >3 TB/s). What the Spark buys you is the ability to hold a 35B model *and* a large KV cache in one pool at all, on a single device, without the multi-GPU rack that capacity would otherwise demand. You trade peak throughput for the fact that the workload fits — which is why generation lands at ~110 tokens/second (see [Throughput Expectations](#throughput-expectations-and-limitations)) rather than cloud-cluster speeds.
 
 What this means in practice:
-- A 35B model fits with room to spare for a massive KV cache
-- The KV cache can grow to 87 GB — enough to hold hundreds of concurrent long-context conversations
+- A 35B model fits with room to spare for a large KV cache
+- The KV pool holds ~2.45 M tokens — about **nine** concurrent conversations at the full
+  262144-token context, or proportionally more at shorter contexts
 - There is no PCIe copy between CPU and GPU memory — both address the same physical pool
 
-The GB10 supports NVFP4 quantization, which is what the `Qwen3.6-35B-A3B-NVFP4` checkpoint uses. The primary benefit is **memory**: weights stored in 4-bit take ~22 GB instead of ~70 GB at BF16 — this is what makes the full 35B model fit alongside the large KV cache. On the compute side, the current vLLM build runs those weights via the **Marlin weight-only path**: weights stay in 4-bit in memory (the size advantage is fully preserved), but at inference time they are dequantized to BF16 before the matrix multiply, which runs on standard BF16 tensor cores. For interactive single-developer decode on a sparse MoE (only ~3B parameters active per token), this distinction barely matters: the bottleneck is reading the small set of active weights from memory, not the speed of the multiply. Measured throughput with this setup is 100–110 tokens/second — fast enough that a 500-token response streams in under 6 seconds.
+The GB10 supports NVFP4 quantization, which is what the `Qwen3.6-35B-A3B-NVFP4` checkpoint uses. The primary benefit is **memory**: weights stored in 4-bit take ~22 GB instead of ~70 GB at BF16 — this is what makes the full 35B model fit alongside the large KV cache. On the compute side, the current vLLM build runs those weights via the **Marlin weight-only path**: weights stay in 4-bit in memory (the size advantage is fully preserved), but at inference time they are dequantized to BF16 before the matrix multiply, which runs on standard BF16 tensor cores.
+
+**This distinction was tested directly, and it does not matter here.** A checkpoint quantized `W4A16_NVFP4` — 4-bit weights, 16-bit activations — *cannot* drive FP4 tensor cores on any GPU, because FP4 tensor cores compute FP4×FP4 and 16-bit activations force the multiply back to 16-bit math. That is the Marlin path by definition. So vLLM's startup warning that "your GPU does not have native support for FP4 computation" is misleading: GB10 *does* have FP4 tensor cores; this checkpoint simply cannot feed them.
+
+We obtained a checkpoint that can (`W4A4`, 4-bit weights *and* activations) and benchmarked native FP4 against Marlin properly. The result was a **wash** (104.1 vs 101.3 tok/s at concurrency 1), and the W4A4 checkpoint was ~16% slower overall because it is 3 GB larger. The reason is in [Throughput Expectations](#throughput-expectations-and-limitations): at low concurrency this machine is **memory-bound**, so the cost of reading weights dominates and the speed of the multiply is nearly irrelevant. Measured throughput with the deployed setup is **110–111 tokens/second** — a 500-token response streams in under 5 seconds.
 
 > **Risk — Driver Version:** NVFP4 requires driver 580.x or later to load the quantized checkpoint. Verify with `nvidia-smi` before investing time in anything else.
 
@@ -103,7 +157,8 @@ NVFP4 quantization is applied on top. NVIDIA released this checkpoint with their
 The stack is not locked to Qwen3.6-35B. Any model with an OpenAI-compatible vLLM endpoint will work — the Nginx reverse proxy is model-agnostic. What does need to change if you swap models:
 
 - **`docker-compose.yml`**: update `--model` to point at the new model directory, `--served-model-name` if you want a different alias, and remove `--reasoning-parser` / `--tool-call-parser` if the new model doesn't support Qwen3's reasoning/tool-call format.
-- **`moe-configs/`**: the pre-tuned kernel config is GB10-specific and MoE-specific. If the new model is a dense transformer (e.g. Llama, Mistral), delete or empty this directory — vLLM will ignore it or find no matching config.
+- **`moe-configs/`**: retained for reference but **no longer mounted** — see [moe-configs](#moe-configs) for why. If you re-enable it for a different model, verify the filename's `dtype=` matches the checkpoint's actual dtype, or it will silently never apply.
+- **Speculative decoding**: `--speculative-config` is model-specific. The DFlash draft model is trained for Qwen3.6 and will not work with anything else. Re-sweep `num_speculative_tokens` for any new model — the optimum is workload- and hardware-dependent, and vendor defaults were badly wrong here.
 - **Memory budget**: recalculate `--gpu-memory-utilization` based on the new model's weight footprint. A model that uses more of the 128 GB for weights leaves less for KV cache, which reduces achievable context length and concurrency.
 - **Quantization**: NVFP4 is specific to NVIDIA-released checkpoints with calibration data baked in. Most open-source models are available in GPTQ, AWQ, or GGUF. vLLM supports GPTQ and AWQ natively; pick the format that the vLLM version you built supports.
 
@@ -139,12 +194,12 @@ cd spark-vllm-docker
 
 > **Risk — Build Time:** With prebuilt wheels the build typically takes ~15–20 minutes. If you force a from-source build (e.g. `--rebuild-vllm` or a custom `--vllm-ref`), it compiles CUDA kernels for Blackwell and can take 30–60 minutes — do not interrupt that, as a partial kernel compilation leaves a broken image.
 
-> **Risk — Image Tag:** The `docker-compose.yml` hardcodes `vllm-node:latest`. If you tag the image differently during the build, update the compose file before proceeding.
+> **Risk — Image Tag:** The `docker-compose.yml` hardcodes `vllm-node-v2:latest`. If you tag the image differently during the build, update the compose file before proceeding.
 
 Verify the build succeeded and vLLM reports the correct version:
 
 ```bash
-docker run --rm --runtime=nvidia vllm-node:latest python3 -c "import vllm; print(vllm.__version__)"
+docker run --rm --runtime=nvidia vllm-node-v2:latest python3 -c "import vllm; print(vllm.__version__)"
 # Must print 0.19 or higher
 ```
 
@@ -170,13 +225,20 @@ The script installs `huggingface_hub` if needed and downloads `nvidia/Qwen3.6-35
 
 This is worth explaining explicitly because it's a tempting optimization that would appear to free up significant memory, and the reason to avoid it is non-obvious.
 
-The KV cache stores the computed key/value attention tensors for every token in every active context window. At BF16 (the default), this cache consumes ~87 GB in this stack. FP8 quantization of the KV cache would roughly halve that, freeing ~44 GB — a huge gain.
+The KV cache stores the computed key/value attention tensors for every token in every active context window. At BF16 (the default), the KV pool plus activations occupies ~68.6 GiB in this stack. FP8 quantization of the KV cache would roughly double its token capacity — a large gain.
 
 However, FP8 KV cache quantization requires per-tensor calibration scales (`k_scale`, `v_scale`, `q_scale`) that tell vLLM how to rescale the values before quantizing them. These scales must be computed on a representative dataset and baked into the checkpoint. **The `Qwen3.6-35B-A3B-NVFP4` checkpoint does not include these scales.**
 
 When scales are missing, vLLM falls back to `scale=1.0` — meaning no rescaling. FP8 E4M3 can only represent values up to 448. Any attention tensor value above 448 is silently clipped. In practice this means the model computes attention over subtly wrong values on long contexts: the kind of errors that produce wrong variable names, hallucinated API signatures that look plausible, or off-by-one logic that's hard to catch in review. This is exactly the wrong failure mode for a coding assistant.
 
-The decision is: leave KV cache at BF16, accept the full ~87 GB cost, and preserve accuracy. **Do not add `--kv-cache-dtype fp8` to the vLLM command.**
+The decision is: leave KV cache at BF16, accept the full cost, and preserve accuracy. **Do not add `--kv-cache-dtype fp8` to the vLLM command with this checkpoint.**
+
+Two later findings that refine — but do not overturn — this conclusion:
+
+- **A different checkpoint does ship the scales.** The `unsloth/Qwen3.6-35B-A3B-NVFP4` variants include calibrated `k_scale`/`v_scale` tensors, and with them FP8 KV cache was measured to be safe (long-context recall passed) and to cost **0% throughput**. So the objection above is specific to *this* checkpoint's missing calibration, not to FP8 KV cache as a technique.
+- **It buys capacity, not speed.** Even where it works, FP8 KV changed throughput by nothing measurable. It is worth adopting only if KV capacity becomes the binding constraint. At `--gpu-memory-utilization 0.75` with ~9 concurrent full-context sequences available and ~30 GiB spare, it is not — which is why the faster NVIDIA checkpoint was kept over the unsloth one despite the latter's working FP8 KV support.
+
+**Always verify before enabling:** check that the checkpoint actually contains `k_scale`/`v_scale` tensors rather than assuming, because the failure mode is silent.
 
 ---
 
@@ -212,7 +274,7 @@ services:
 
   # ── Qwen3.6-35B-A3B-NVFP4 coding model ───────
   vllm-coding:
-    image: vllm-node:latest  # Built locally via eugr/spark-vllm-docker for DGX Spark — must be vLLM ≥0.19 for NVFP4
+    image: vllm-node-v2:latest  # Built locally via eugr/spark-vllm-docker — must be vLLM ≥0.19 for NVFP4
     container_name: vllm-coding
     runtime: nvidia
     restart: "no"
@@ -221,12 +283,11 @@ services:
     volumes:
       - models:/models
       - huggingface-cache:/root/.cache/huggingface
-      - ./moe-configs:/moe-configs:ro
+      # ./moe-configs is deliberately NOT mounted — see the moe-configs section
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - HF_TOKEN=${HF_TOKEN:-}
       - VLLM_LOGGING_LEVEL=WARNING
-      - VLLM_TUNED_CONFIG_FOLDER=/moe-configs
     command:
       - "python3"
       - "-m"
@@ -240,24 +301,27 @@ services:
       - "--port"
       - "8000"
       - "--max-model-len"
-      - "131072"
+      - "262144"
       - "--gpu-memory-utilization"
-      - "0.85"
+      - "0.75"
       - "--tensor-parallel-size"
       - "1"
       - "--enable-prefix-caching"
       - "--max-num-seqs"
       - "32"
+      - "--max-num-batched-tokens"
+      - "8192"
       - "--reasoning-parser"
       - "qwen3"
       - "--enable-auto-tool-choice"
       - "--tool-call-parser"
       - "qwen3_coder"
       - "--language-model-only"    # Skip vision encoder — not needed for coding, frees VRAM
-      # NOTE: ngram speculative decoding (--spec-method ngram --spec-tokens 5) was
-      # removed — on vLLM 0.22.1rc1 it crashed EngineCore with a KV-cache block
-      # accounting assertion (num_required_blocks off by one) on large contexts.
-      # Re-enable once on a vLLM release where that's fixed.
+      - "--speculative-config"
+      - '{"method":"dflash","model":"/models/Qwen3.6-35B-A3B-DFlash","num_speculative_tokens":4}'
+      # NOTE: ngram speculative decoding was removed — it crashed EngineCore on
+      # vLLM 0.22.1rc1, and when later retested scored 47.8 tok/s at 17.2%
+      # acceptance vs 123.7 for a real draft model.
     ports:
       - "127.0.0.1:8001:8000"   # debug port — loopback only, never network-reachable
     deploy:
@@ -271,7 +335,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 300s
+      start_period: 600s   # measured cold start is 341–461s; see note below
 
   # ── Anthropic normalizing shim ─────────────────
   # Claude Code injects a system-role message into messages[]; vLLM's native
@@ -345,17 +409,29 @@ A few things worth calling out:
 
 **`--reasoning-parser qwen3` and `--tool-call-parser qwen3_coder`** enable structured output parsing. Qwen3 uses a chain-of-thought reasoning format (`<think>...</think>`) and a specific tool call format; without these parsers vLLM would return the raw tokens and Claude Code would see malformed responses.
 
-**`VLLM_TUNED_CONFIG_FOLDER=/moe-configs`** points vLLM at the mounted `moe-configs/` directory so it can load a pre-tuned Triton config for its fused-MoE GEMM kernel instead of tuning that kernel itself. See the [moe-configs section](#moe-configs) below.
+**`--max-num-batched-tokens 8192`** raises the scheduler's per-step token budget from the implicit default of 2048. vLLM warns explicitly that the default starves speculative-decoding draft slots. Honest caveat: the measured gain sits **at the noise floor and is not established** — it is kept because it is the documented-correct setting for a spec-decode configuration, not because we proved it faster.
 
-**`--speculative-config '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}'`** enables MTP (Multi-Token Prediction) speculative decoding using the model's own built-in prediction heads. These heads propose 3 candidate tokens per decode step from the hidden states already computed; vLLM verifies them all in a single batched forward pass. On coding workloads, measured acceptance is ~78% at position 0, ~56% at position 1, ~43% at position 2, yielding ~2.8 tokens per forward pass. The `moe_backend":"triton"` routes MoE expert computation through the same pre-tuned Triton kernel used for normal decoding. Earlier ngram speculative decoding (`--spec-method ngram --spec-tokens 5`) was removed — it crashed vLLM's `EngineCore` with a KV-cache block accounting assertion on large contexts; MTP uses a different code path and does not have this issue.
+**`--speculative-config '{"method":"dflash","model":"/models/Qwen3.6-35B-A3B-DFlash","num_speculative_tokens":4}'`** enables speculative decoding with **DFlash**, a separate 0.77 GB six-layer dense draft model. The draft model proposes 4 candidate tokens per step; vLLM verifies all 4 in a single batched forward pass through the full target model. When candidates are accepted the sequence advances several tokens for the cost of one forward pass.
+
+This is **the single largest tunable win in the stack: +44%** over no speculation (111.4 vs 77.3 tok/s at concurrency 1). Two non-obvious points, both established by measurement in [OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md):
+
+- **The draft length was swept, not copied.** The upstream recipe for a different quantization of this model uses 15. On this hardware 15 was the *worst* value tested, and at concurrency 4 it was **slower than disabling speculation entirely**. The accepted-token count is roughly constant regardless of draft length — the draft model only ever gets 2–3 tokens right, so everything beyond that is verification cost with no return.
+- **DFlash was chosen over MTP because of the workload.** The checkpoint ships built-in Multi-Token Prediction heads, which need no separate draft model. MTP is a perfectly good choice — it simply loses here on tool calls (−7.2%) and concurrency (−9.1%) while winning slightly on prose. Speculation pays off in proportion to how predictable the output is, and agentic traffic is dominated by structured tool calls and code edits. **A prose-heavy deployment should prefer MTP:** `'{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}'` — note that MTP's spec config *requires* `"moe_backend":"triton"`, because its draft layer is unquantized BF16 and omitting the field crashes `EngineCore`.
 
 **`anthropic-shim`** is a separate Docker service running a stdlib-only Python HTTP server. It mounts `shim/shim.py` into the container and depends on `vllm-coding` being healthy. Nginx also depends on it (see the `depends_on` in the `nginx` service).
 
-**`depends_on: condition: service_healthy`** means Nginx will not start until both vLLM and the shim pass their healthchecks. The 300s `start_period` gives vLLM time to load weights and compile CUDA graphs before its healthcheck begins polling.
+**`depends_on: condition: service_healthy`** means Nginx will not start until both vLLM and the shim pass their healthchecks. The `start_period` gives vLLM time to load weights and compile CUDA graphs before the healthcheck begins counting failures.
+
+> **Why 600s and not 300s.** Cold start was measured across ten container recreates at **341–461 seconds**. The old 300s `start_period` plus 5 retries × 30s gave 450s of total grace — *below an observed load time*. A slow start would flip the container to `unhealthy`, and because both Nginx and the shim gate on `service_healthy`, the whole stack would stall behind it. Set this from measured load time, not a guess.
 
 **`MODEL_PATH` in the volume definition** reads from `.env`. If the variable is unset, it falls back to `/data/models`. The volume bind-mounts that host path into the container at `/models`, which is where the vLLM `--model` flag points.
 
 ### moe-configs
+
+> **Status: retained for reference, deliberately NOT mounted.** The directory and its
+> `VLLM_TUNED_CONFIG_FOLDER` environment variable were both removed from
+> `docker-compose.yml`. The explanation below is kept because the mechanism is worth
+> understanding — and because the reason it was removed is a useful cautionary tale.
 
 The `moe-configs/` directory holds pre-tuned Triton kernel configurations for vLLM's MoE (Mixture of Experts) GEMM kernels on the GB10 GPU. The filename encodes the tuning target:
 
@@ -365,7 +441,20 @@ E=256,N=512,device_name=NVIDIA_GB10,dtype=fp8_w8a8,block_shape=[128,128].json
 
 Each file maps batch sizes (1, 2, 4, 8 … 4096) to optimal Triton tile parameters (`BLOCK_SIZE_M/N/K`, `GROUP_SIZE_M`, `num_warps`, `num_stages`). The filename is the lookup key — vLLM uses this config only when the kernel it selects for the model matches that key (expert count `E`, intermediate size `N`, `device_name`, `dtype`, and `block_shape`). When it matches, vLLM loads the pre-computed parameters instead of tuning the fused-MoE GEMM itself; when it doesn't, vLLM falls back to a generic config or its own tuning pass for that kernel.
 
-Note this only covers the Triton fused-MoE GEMM. vLLM still runs other startup tuning passes regardless of this file (you'll see a FlashInfer `fp8_gemm` autotuner run in the logs), so it is not the only thing happening during the cold start.
+**Why it was removed.** Read the filename again: `dtype=fp8_w8a8`. This model is **NVFP4**, not FP8. The key never matched, so the config was never loaded — it had been inert since the day it was added, and every "it's helping" assumption about it was wrong.
+
+Renaming it to what vLLM actually looks for made things worse, not better: the config loaded and then crashed the engine outright with
+
+```
+triton.runtime.errors.OutOfResources: shared memory,
+Required: 294912, Hardware limit: 101376
+```
+
+The tile parameters were tuned for a GPU with roughly 3× GB10's shared memory per SM. **The filename mismatch had been silently protecting the stack from a config that would have crashed it.** Leaving the directory mounted is therefore a latent hazard: if a future vLLM release loosens its matching rules, a file that does nothing today becomes a file that takes the server down.
+
+If you want a genuinely tuned MoE config for this hardware, generate one with vLLM's own `benchmark_moe.py` against *this* GPU and *this* dtype. Do not reuse one from another machine.
+
+Note this only ever covered the Triton fused-MoE GEMM. vLLM still runs other startup tuning passes regardless (you'll see a FlashInfer `fp8_gemm` autotuner run in the logs), so it was never the only thing happening during the cold start.
 
 These configs are hardware-specific: a config tuned for the GB10 will not perform well on an A100 or H100. If you are running on different hardware, either delete the `moe-configs/` directory or generate new configs using vLLM's tuning utilities.
 
@@ -505,7 +594,7 @@ Startup sequence:
 ```
 [1] vllm-coding starts
        ↓  loads NVFP4 weights into unified memory (~22 GB)
-       ↓  allocates PagedAttention KV cache pool (~87 GB)
+       ↓  allocates PagedAttention KV cache pool (~68.6 GiB, 2.45 M tokens)
        ↓  compiles CUDA graphs for common batch sizes
        ↓  healthcheck passes at /health   ← takes 3–5 minutes
 [2] anthropic-shim starts (waits for vllm-coding healthy)
@@ -517,7 +606,7 @@ Startup sequence:
 
 The 3–5 minute startup is not just loading weights. vLLM is also:
 
-1. **Allocating the KV cache:** PagedAttention divides the ~87 GB KV cache pool into fixed-size pages (blocks). This allocation must happen upfront so that concurrent requests can be scheduled deterministically. The `--gpu-memory-utilization 0.85` flag tells vLLM to commit 85% of the 128 GB unified memory pool for weights + KV cache combined.
+1. **Allocating the KV cache:** PagedAttention divides the ~68.6 GiB KV cache pool into fixed-size pages (blocks). This allocation must happen upfront so that concurrent requests can be scheduled deterministically. The `--gpu-memory-utilization 0.75` flag tells vLLM to commit 75% of the unified memory pool for weights + KV cache combined — ~91.2 GiB measured, holding 2,453,340 KV tokens.
 2. **Compiling CUDA graphs:** For common input shapes (batch size 1, 2, 4, 8, etc.), vLLM pre-compiles optimized CUDA execution graphs. At inference time, the graph is replayed rather than re-dispatched, reducing per-token latency significantly.
 
 Monitor startup:
@@ -541,7 +630,11 @@ Before connecting clients, it's worth understanding the three inference optimiza
 
 **Prefix caching** stores the computed KV tensors for prompt prefixes that have been seen before. Claude Code always sends the same large system prompt (several thousand tokens of instructions about tools, file formats, and behavior). Without prefix caching, every request recomputes those KV tensors from scratch — wasting compute proportional to the system prompt length. With prefix caching enabled, the first request pays the full cost, and every subsequent request in the same session skips the system prompt computation entirely. For Claude Code's usage pattern (many requests per session, identical system prompt), this is one of the highest-impact optimizations in the stack.
 
-**MTP speculative decoding** exploits a property of code generation: code is highly repetitive and locally predictable. The Qwen3.6-35B-A3B-NVFP4 checkpoint includes built-in Multi-Token Prediction heads that propose 3 candidate tokens per decode step using hidden states already computed for the current position — no separate draft model required. vLLM verifies all 3 candidates in a single batched forward pass through the full target model. When candidates are accepted (frequently, for boilerplate patterns like `return None`, `self.`, identifiers just introduced), the sequence advances by 2–3 tokens for the cost of 1 forward pass. Measured on coding workloads: ~2.8 tokens per forward pass on average, yielding ~100–110 tok/s vs. the ~60–80 tok/s baseline without speculative decoding.
+**DFlash speculative decoding** exploits a property of agentic and code generation: the output is highly repetitive and locally predictable. A separate 0.77 GB six-layer draft model proposes 4 candidate tokens per decode step; vLLM verifies all 4 in a single batched forward pass through the full target model. When candidates are accepted (frequently, for JSON tool-call scaffolding, boilerplate like `return None`, and identifiers just introduced), the sequence advances several tokens for the cost of one forward pass.
+
+**This is the largest tunable win in the stack.** Measured across four representative workloads: **111.4 tok/s vs 77.3 without speculation — +44%** at concurrency 1, and 227.8 vs 181.3 (+26%) at concurrency 4, at ~53% draft-token acceptance.
+
+Why it matters so much here specifically: at low concurrency this box is **memory-bound**, spending most of its time reading weights rather than computing. Speculation is the one lever that produces more output tokens per weight-read, which is exactly the constrained resource. That is also why kernel-level optimizations produced nothing measurable — see [OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md).
 
 
 **PagedAttention** manages the KV cache as virtual memory pages rather than pre-allocating contiguous blocks per sequence. This is what allows `--max-num-seqs 32` — 32 concurrent requests in flight — without each one reserving 128K × KV cache bytes upfront. Pages are allocated on demand as context grows, and released immediately when a sequence completes. This matters for interactive coding use: when Claude Code has 10 open editor contexts, each making occasional requests, PagedAttention ensures they share the KV cache pool efficiently rather than starving each other.
@@ -623,11 +716,27 @@ The `systemMessage: "/no_think"` is required. The model reasons by default; vLLM
 
 **Latency (time to first token):** On a warm cache hit (second request in a session with same system prompt), first-token latency is typically 1–3 seconds. Cold requests (new session, full system prompt recomputation) take 3–8 seconds depending on prompt length.
 
-**Throughput (tokens/second):** Expect 100–110 tokens/second on typical coding responses with MTP speculative decoding active — a 500-token response streams in under 6 seconds. Acceptance rate varies by workload: structured code (high repetition, predictable identifiers) sits at ~78% for the first draft token and ~43% for the third, yielding ~2.8 tokens per target-model forward pass. Unstructured prose is lower. The baseline without speculative decoding is ~60–80 tok/s.
+**Throughput (tokens/second):** Measured with DFlash speculative decoding active, medians over n=14 trials per workload:
 
-**Context window:** The stack is configured for 128K tokens (`--max-model-len 131072`). In practice, Claude Code rarely exceeds 32K tokens per request. The full 128K is available if needed, but very long contexts increase KV cache consumption and reduce how many concurrent sequences can be served simultaneously.
+| workload | tok/s @ c=1 |
+|---|---|
+| code edits | 121.0 |
+| tool calls (structured JSON) | 118.7 |
+| general reasoning | 104.1 |
+| novel prose | 100.1 |
+| **overall (median of the above)** | **111.4** |
+| *no speculative decoding* | *77.3* |
 
-**Concurrency ceiling:** `--max-num-seqs 32` allows 32 in-flight requests. For a single developer this is never the bottleneck. For a small team sharing the stack, it provides comfortable headroom. The real ceiling is KV cache exhaustion: if all 32 sequences are holding large contexts simultaneously, PagedAttention will begin queuing new requests.
+Aggregate throughput at 4 concurrent streams is **227.8 tok/s**; draft acceptance is ~53%.
+A 500-token response streams in under 5 seconds.
+
+**Note the spread between workloads is larger than most configuration deltas.** Speculation pays off in proportion to how predictable the output is, so structured tool calls run ~20% faster than novel prose on identical settings. Benchmark on prompts that resemble your actual traffic — a single unrepresentative prompt can invert a conclusion.
+
+**This is memory-bound, not compute-bound.** Roughly 0.9 GB of weights is read per token against a ~273 GB/s ceiling, putting the machine at about a quarter of peak bandwidth. A sustained single-stream run showed 93% reported GPU utilization at **26.7 W** — stalled on memory, not computing. This is why speculative decoding (more tokens per weight-read) is the dominant lever and why kernel-level changes measured as noise.
+
+**Context window:** The stack is configured for **256K tokens** (`--max-model-len 262144`). This is deliberately larger than needed. Claude Code assumes a ~200K window for any custom endpoint and has no way to learn the backend's real limit; with the previous 131072 setting it would compose requests that vLLM hard-rejected with `prompt + max_tokens > max-model-len` before generation began, surfacing to the user as a spinner that never resolved. Setting the server's window *above* what the client assumes makes the client's own auto-compaction fire safely below the real wall. The extra headroom is nearly free: only 10 of the model's 40 layers use a growing KV cache (~20 KiB/token), so doubling the window cost about 2.7 GB per maximally-long sequence, not a doubling of memory.
+
+**Concurrency ceiling:** `--max-num-seqs 32` allows 32 in-flight requests, but the real ceiling is KV capacity. vLLM reports a pool of **2,453,340 tokens** and `kv_cache_max_concurrency` of **9.36** — about nine simultaneous sequences at the *full* 262144-token context, proportionally more at realistic lengths. For a single user this is never the bottleneck; for a small team, watch this metric rather than `--max-num-seqs`.
 
 **The honest comparison to cloud:** A local stack trades latency predictability for cost and privacy. Cloud APIs serve requests from large GPU clusters and can burst to higher throughput. This stack will have more variance — a fresh model load or an unusually long context can cause noticeable pauses. The benefit is that every token generated stays on your hardware.
 
@@ -639,9 +748,9 @@ The `systemMessage: "/no_think"` is required. The model reasons by default; vLLM
 |---|---|---|---|
 | 1 | Driver < 580.x | Critical | Check `nvidia-smi` before building — NVFP4 requires Blackwell driver |
 | 2 | vLLM < 0.19 | Critical | Build from `eugr/spark-vllm-docker` — NVFP4 kernel support added in 0.19 |
-| 3 | FP8 KV cache flag added | High | Do NOT add `--kv-cache-dtype fp8` — checkpoint lacks calibration scales, causes silent value clipping |
+| 3 | FP8 KV cache flag added | High | Do NOT add `--kv-cache-dtype fp8` with *this* checkpoint — it lacks `k_scale`/`v_scale`, causing silent value clipping. Verify the scales exist before enabling on any checkpoint |
 | 4 | No authentication | High | API is wide open to anyone who can reach the port — add an Nginx bearer-token check before exposing beyond a trusted LAN; never port-forward without it |
 | 5 | No TLS on Nginx | High | Add certs if not on a private LAN — all tokens, API keys, and prompt source code are plaintext on :80 |
-| 6 | `restart: "no"` | Medium | Change to `unless-stopped` for production — OOM or CUDA error requires manual recovery |
+| 6 | `restart: "no"` | Medium | Change to `unless-stopped` for production — OOM or CUDA error requires manual recovery. Kept as `no` here so crashes stay visible rather than silently restart-looping; the client-side fallback provider covers availability |
 | 7 | Streaming timeouts | Medium | Tune `proxy_read_timeout` upward if you see 504 errors on long generations |
-| 8 | Cold start ~5 min | Low | Wait for healthcheck before testing — the stack is not broken, it's loading |
+| 8 | Cold start 6–8 min | Low | Measured 341–461s across 10 recreates. Wait for the healthcheck — the stack is not broken, it's loading. `start_period` must exceed your slowest observed load |

@@ -16,6 +16,11 @@ models/
 # Generated docs — markdown + SVG are canonical; don't commit rendered PDFs
 *.pdf
 
+# Benchmark artifacts — results and the sweeper's compose backup
+bench/res_*.json
+bench/*.log
+bench/docker-compose.yml.orig
+
 # Python / OS cruft
 __pycache__/
 *.pyc
