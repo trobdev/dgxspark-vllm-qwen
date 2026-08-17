@@ -71,8 +71,9 @@ chmod +x download-models.sh
 docker compose up -d
 ```
 
-Watch startup (first load takes ~3–5 minutes — weights load, the KV cache pool is
-allocated, and CUDA graphs compile; the healthcheck allows up to 5 minutes):
+Watch startup (a cold start measures 341–461s — weights load, the KV cache pool is
+allocated, and CUDA graphs compile; the healthcheck allows 600s before it counts
+failures):
 
 ```bash
 docker compose logs -f vllm-coding
@@ -101,7 +102,7 @@ The model is served at an OpenAI-compatible endpoint and an Anthropic-compatible
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://192.168.1.100/coding/v1",
+    base_url="http://<dgx-ip>/coding/v1",
     api_key="none",
 )
 

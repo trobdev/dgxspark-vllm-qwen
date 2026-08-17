@@ -188,8 +188,8 @@ Watch the model load:
 docker compose logs -f vllm-coding
 ```
 
-A healthy first startup takes ~3–5 minutes (weights load, the KV cache pool is allocated,
-and CUDA graphs compile; the healthcheck allows up to 5 minutes) and ends with:
+A healthy first startup measures 341–461s (weights load, the KV cache pool is allocated,
+and CUDA graphs compile; the healthcheck allows 600s) and ends with:
 ```
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://0.0.0.0:8000

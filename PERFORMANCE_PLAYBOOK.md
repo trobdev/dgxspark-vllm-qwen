@@ -240,9 +240,11 @@ vendor claim.**
 **3. Check for `k_scale`/`v_scale` tensors** in `model.safetensors.index.json`. Present ->
 `--kv-cache-dtype fp8` is safe. Absent -> it will silently clip; do not enable.
 
-**4. Verify driver/CUDA compatibility BEFORE building.** Never update the GPU driver
-(see the hard constraint in `V2_PLAN.md`). Confirm the target CUDA base image is <= what
-the driver natively supports, or that a `cuda-compat` layer covers it.
+**4. Verify driver/CUDA compatibility BEFORE building.** **Never update the GPU driver** —
+on a DGX Spark-class appliance the driver is part of the shipped platform, and replacing it
+risks an unbootable box with no local recovery path. Adapt the container to the driver, not
+the reverse. Confirm the target CUDA base image is <= what the driver natively supports, or
+that a `cuda-compat` layer covers it.
 
 **5. Benchmark tuned-vs-tuned.** Comparing a tuned config against an untuned one produced
 a wrong conclusion twice in one session. Fix the tuning first, then compare.

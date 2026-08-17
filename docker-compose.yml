@@ -1,3 +1,21 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Qwen3.6-35B-A3B-NVFP4 on a GB10 / DGX Spark-class box (128 GB unified).
+#
+#  This is the whole stack: vLLM, an Anthropic-compatible shim, and nginx.
+#  Claude Code and Hermes both route here.
+#
+#      docker compose up -d      # start
+#      docker compose down       # stop
+#
+#  Every value below that is not a default was measured, not guessed. The
+#  reasoning is inline — read the comment before changing a flag.
+#  See OPTIMIZATION_REPORT.md for how they were derived and
+#  PERFORMANCE_PLAYBOOK.md for what was tried and rejected.
+#
+#  DO NOT change `name:` below. The project name binds this file to the running
+#  containers and to the dgx-llm-stack_models / dgx-llm-stack_huggingface-cache
+#  volumes; changing it would orphan both.
+# ─────────────────────────────────────────────────────────────────────────────
 name: dgx-llm-stack
 
 services:
@@ -17,6 +35,12 @@ services:
     volumes:
       - models:/models
       - huggingface-cache:/root/.cache/huggingface
+      # Persist vLLM's compiled artifacts across container RECREATES. Without
+      # this they live in the container's writable layer, which `compose down`
+      # destroys, so every recreate recompiles from scratch. Measured on a
+      # 2026-08-16 cold start: torch.compile + FlashInfer autotune were ~117s of
+      # a ~350s start. `docker restart` preserved them; `compose down` did not.
+      - vllm-cache:/root/.cache/vllm
       # NOTE: ./moe-configs is intentionally NOT mounted. The only file there is
       # E=256,N=512,...,dtype=fp8_w8a8 — tuned for the FP8 checkpoint, not NVFP4.
       # It never applied (dtype mismatch), and forcing it to match crashed Triton
@@ -40,6 +64,8 @@ services:
       # FP8 KV cache (2x KV capacity) — revisit only if KV becomes binding.
       - "--model"
       - "/models/Qwen3.6-35B-A3B-NVFP4"
+      # Every client requests this id literally — Hermes config.yaml,
+      # bench/validate.py, bench/bench_hermes.py. Do not rename it.
       - "--served-model-name"
       - "coding"
       - "--host"
@@ -129,6 +155,12 @@ services:
     depends_on:
       vllm-coding:
         condition: service_healthy
+    ports:
+      # Direct route to the shim for clients that set ANTHROPIC_BASE_URL, so the
+      # Anthropic path can be exercised without going through nginx. nginx still
+      # proxies this shim internally on :80 — this is an addition, not a
+      # replacement. Loopback only, for the same reason as 8001 below.
+      - "127.0.0.1:8003:8080"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz').status==200 else 1)"]
       interval: 30s
@@ -176,4 +208,9 @@ volumes:
       device: ${MODEL_PATH:-/data/models}
 
   huggingface-cache:
+    driver: local
+
+  # torch.compile graphs + FlashInfer autotune configs (~285 MB once warm).
+  # Safe to delete to force a clean recompile; it only costs the rebuild time.
+  vllm-cache:
     driver: local

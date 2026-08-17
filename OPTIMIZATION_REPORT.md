@@ -349,8 +349,7 @@ using only the standard library:
   restores on exit. Sweeps are declarative lists of configs.
 - **`validate.py`** — seven functional checks across both API surfaces, run before any commit.
 
-Companion documents in this repository: **`PERFORMANCE_PLAYBOOK.md`** (ranked levers,
-negative results, upgrade evaluation procedure) and **`V2_PLAN.md`** (rollback procedure and
-risk register).
+Companion document in this repository: **`PERFORMANCE_PLAYBOOK.md`** (ranked levers,
+negative results, upgrade evaluation procedure).
 
 ---
