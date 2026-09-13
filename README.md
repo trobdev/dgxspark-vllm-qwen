@@ -71,9 +71,10 @@ chmod +x download-models.sh
 docker compose up -d
 ```
 
-Watch startup (a cold start measures 341–461s — weights load, the KV cache pool is
-allocated, and CUDA graphs compile; the healthcheck allows 600s before it counts
-failures):
+Watch startup (a recreate with the `vllm-cache` volume warm measures 285–294s — weights
+load, the KV cache pool is allocated, and CUDA graphs compile. A true cold start, with that
+cache empty, adds roughly 117s of torch.compile and FlashInfer autotune on top. The
+healthcheck allows 600s before it counts failures, which is sized for the cold case):
 
 ```bash
 docker compose logs -f vllm-coding

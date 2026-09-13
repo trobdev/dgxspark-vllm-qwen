@@ -275,6 +275,10 @@ Not performance work, but found by the same process:
   but measured cold start across 10 container recreates is **341–461s** — below an observed
   load time. A slow start would flip the container unhealthy and stall nginx and the API shim,
   both of which gate on `service_healthy`. Raised to 600s.
+  *Re-measured 2026-09-13* after adding `--safetensors-load-strategy prefetch`: a warm-cache
+  recreate is **285–294s** (n=2). `start_period` was deliberately **left at 600s** — the new
+  figure is a warm-cache number and the budget has to cover the cold case, which still pays
+  the compile. Sizing a timeout from the fast path is the mistake this bullet exists to record.
 - **Latent kernel hazard.** The mounted MoE tuning config was for a different dtype and never
   matched. Harmless today, but a future vLLM loosening its matching rules would have crashed
   the server. Unmounted.
@@ -303,6 +307,41 @@ Not performance work, but found by the same process:
 
 **Measured:** 110–111 tok/s at c=1, ~227 tok/s aggregate at c=4, 53% speculative acceptance,
 93,381 MiB GPU (~91 GiB), ~17 GiB host memory free.
+
+### 6.1 Addendum — 2026-09-13 startup/scheduler pass
+
+Three flags added. **None of them changed throughput, and none were expected to.**
+
+```yaml
+CUDA_MODULE_LOADING=LAZY          # env
+HF_HUB_OFFLINE=1                  # env — verified nothing resolves from the hub
+TRANSFORMERS_OFFLINE=1            # env
+--safetensors-load-strategy prefetch
+--async-scheduling
+```
+
+- **`--safetensors-load-strategy prefetch`** — warm-cache recreate 341–461s → **285–294s**
+  (n=2). Load-path only. Replaces 0.24's `--load-format fastsafetensors`, which does not
+  exist on 0.26. Phase breakdown of a 294s start: ~65s FlashInfer autotune *with cache hits*,
+  ~53s CUDA graph capture — so the loader was never the dominant cost and **autotune is the
+  larger remaining target**.
+- **`--async-scheduling`** — **already on by default**; adding it was a no-op. Kept as a
+  fail-loud guard, since the unset path disables silently at a log level `WARNING` hides.
+- **Offline env vars** — startup robustness, not speed. Verified safe first: the HF cache
+  volume held 4 KB with no `models--*` directories and both checkpoints have local configs.
+
+**Re-verified baseline, n=14 each, two runs of the functionally identical config:**
+
+| | c=1 median-of-medians | c=4 aggregate | acceptance |
+|---|---|---|---|
+| run 1 | 115.9 tok/s | 229.1 tok/s | 53.6% |
+| run 2 | 118.6 tok/s | 245.4 tok/s | 54.6% |
+
+Both sit at or slightly above the 110–111 / ~227 figures above, so the original numbers stand
+as conservative. The spread *between two identical runs* — +2.3% at c=1, **+7.1% at c=4** —
+is the important result and is analysed in
+[PERFORMANCE_PLAYBOOK.md §8.2](PERFORMANCE_PLAYBOOK.md). `start_period` was deliberately left
+at 600s; see §5.
 
 **Validated 7/7** before commit: OpenAI tool calling, tool-result round-trip, reasoning/content
 separation, **241,815-token context recall** (retrieved a specific line verbatim), Anthropic

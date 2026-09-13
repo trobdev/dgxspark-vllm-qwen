@@ -188,8 +188,10 @@ Watch the model load:
 docker compose logs -f vllm-coding
 ```
 
-A healthy first startup measures 341–461s (weights load, the KV cache pool is allocated,
-and CUDA graphs compile; the healthcheck allows 600s) and ends with:
+A healthy first startup measures 341–461s — it is genuinely cold, so it pays torch.compile
+and FlashInfer autotune in full (weights load, the KV cache pool is allocated, and CUDA
+graphs compile; the healthcheck allows 600s). Later recreates reuse the `vllm-cache` volume
+and measure 285–294s. Startup ends with:
 ```
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://0.0.0.0:8000

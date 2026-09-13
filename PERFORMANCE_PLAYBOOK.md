@@ -146,6 +146,21 @@ the regime vendors benchmark in — which is why their numbers don't match yours
 - `--max-num-batched-tokens 8192`: gain **NOT established** — the observed 101.3 -> 108.1
   sits exactly at the +-7% noise floor (see S8). Keep it anyway: vLLM explicitly warns the
   implicit 2048 starves spec-decode draft slots, so it is the documented-correct setting.
+- `--async-scheduling`: **no gain available — it was already on.** vLLM 0.26 defaults
+  `async_scheduling` to `None`, and the `None` path *enables* it unless something is
+  incompatible (`config/vllm.py`). Nothing here is: `dflash` is in `EagleModelTypes`,
+  `UniProcExecutor` (TP=1) supports it, `disable_padded_drafter_batch` defaults `False`.
+  So every number in this document was already measured with async scheduling active, and
+  passing the flag explicitly changed nothing. **Keep the flag anyway, for safety not speed:**
+  when set explicitly an incompatible config *raises* at startup; when left unset vLLM
+  silently disables it and says so only at `INFO`, which `VLLM_LOGGING_LEVEL=WARNING` hides.
+  Same failure shape as the Hermes `compression.threshold` 0.75 floor — a setting that looks
+  right while doing nothing. Prefer the spelling that fails loudly.
+- `--safetensors-load-strategy prefetch`: **load-path only, by construction.** Cut warm-cache
+  recreate time from the 341-461s band to 285-294s (n=2), with no throughput change — as
+  expected, since it cannot touch steady-state decode. Note the phase breakdown: of a 294s
+  start, ~65s is FlashInfer autotune *despite* cache hits and ~53s is CUDA graph capture, so
+  the loader was never the dominant term. **Autotune is the larger remaining target.**
 - MoE backend choice: **no measurable difference**, tested properly on the checkpoint
   unsloth's guidance targets (`-Fast`, W4A4), backend as the only variable, n=6:
 
@@ -171,6 +186,8 @@ the regime vendors benchmark in — which is why their numbers don't match yours
 | Chasing higher-TFLOP kernels generally | Same reason. |
 | Larger `--max-model-len` | Free. Costs only KV pool allocation, not speed. |
 | `--gpu-memory-utilization` | Affects capacity/headroom, not throughput. |
+| `--async-scheduling` (as a *tuning* change) | **No gain — already vLLM's default here.** Worth setting explicitly only so an incompatible future config fails loudly instead of silently. |
+| `--safetensors-load-strategy prefetch` (as a *throughput* change) | **No gain, and cannot have one.** Real ~15-35% cut to recreate time; strictly load-path. |
 
 ---
 
@@ -252,7 +269,16 @@ a wrong conclusion twice in one session. Fix the tuning first, then compare.
 **6. Sweep, don't copy.** `num_speculative_tokens` and `--max-num-batched-tokens` are
 hardware-dependent. Vendor defaults are tuned for vendor hardware.
 
-**7. Validate correctness, not just speed.** Coherence, tool calling, thinking blocks
+**7. Check what the new build already does by default — before crediting a flag.**
+Two failure modes, both hit on 2026-09-13. *Defaults move:* `--async-scheduling` reads like
+a tuning knob but vLLM 0.26 already enables it whenever the config permits, so "adding" it
+measures nothing. Resolve the actual default in `config/` rather than assuming `False`.
+*Flags get renamed:* 0.24's `--load-format fastsafetensors` does not exist on 0.26, which
+replaced it with `--safetensors-load-strategy {eager,lazy,prefetch,torchao}`. A flag copied
+from an older recipe can be silently ignored, or a feature you think you enabled can already
+be on. Read the resolution logic; a benchmark cannot tell these apart from "no effect".
+
+**8. Validate correctness, not just speed.** Coherence, tool calling, thinking blocks
 through the shim, and long-context recall (FP8 KV clipping shows up as degraded recall,
 not as an error).
 
@@ -318,6 +344,37 @@ results in this document:
 **Method:** warm up first (the first run after a restart is 3-10x slower from JIT), run at
 least 5 trials for anything you intend to act on, and re-measure the baseline in the same
 session rather than comparing against a number from hours earlier.
+
+### 8.2 A natural experiment: two identical configs, measured 2026-09-13
+
+The `--async-scheduling` round accidentally produced the cleanest possible noise measurement.
+The flag was already vLLM's default (see Tier 5), so the "before" and "after" runs were
+**functionally the same configuration** — same weights, same spec-decode, same scheduler.
+Both were n=14 through `bench_hermes.py`, separated by a container recreate:
+
+| Run | c=1 median-of-medians | c=4 aggregate | acceptance |
+|---|---|---|---|
+| `baseline-r1` | 115.9 tok/s | 229.1 tok/s | 53.6% |
+| `round2-async` | 118.6 tok/s | 245.4 tok/s | 54.6% |
+| **apparent delta** | **+2.3%** | **+7.1%** | +1.0pp |
+
+**Nothing changed between those runs.** Read the +7.1% at c=4 carefully: an identical config,
+benchmarked twice at n=14, moved by the exact magnitude this document elsewhere calls a
+"+7%, at the noise floor, not established" result. Had the default-on fact been missed, the
+honest-looking conclusion would have been "async scheduling buys +7% at concurrency 4" — and
+it would have been entirely wrong.
+
+Two things follow, and they supersede the n=3 guidance above:
+
+1. **c=4 aggregate is the noisier metric, not the more reliable one.** Run-to-run variance at
+   c=4 (7.1%) exceeded c=1 (2.3%) here, despite c=4 summing four streams. Do not treat an
+   aggregate number as more trustworthy because it is bigger.
+2. **A recreate is part of the experiment.** These runs differed by a container restart, which
+   re-ran CUDA graph capture and autotune. Any A/B that requires a restart inherits that
+   variance, so single before/after pairs cannot resolve anything under ~10% at c=4.
+
+This is direct empirical support for the +-7% band, obtained without needing a control:
+the control ran itself.
 
 ### 8.1 The noise floor is not instrument error (important correction)
 

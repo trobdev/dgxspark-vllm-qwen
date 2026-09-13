@@ -288,6 +288,9 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - HF_TOKEN=${HF_TOKEN:-}
       - VLLM_LOGGING_LEVEL=WARNING
+      - CUDA_MODULE_LOADING=LAZY       # defer CUDA module loads until first use
+      - HF_HUB_OFFLINE=1               # nothing resolves from the hub; see note below
+      - TRANSFORMERS_OFFLINE=1
     command:
       - "python3"
       - "-m"
@@ -300,6 +303,8 @@ services:
       - "0.0.0.0"
       - "--port"
       - "8000"
+      - "--safetensors-load-strategy"
+      - "prefetch"
       - "--max-model-len"
       - "262144"
       - "--gpu-memory-utilization"
@@ -311,6 +316,7 @@ services:
       - "32"
       - "--max-num-batched-tokens"
       - "8192"
+      - "--async-scheduling"          # already vLLM's default here; kept as a fail-loud guard
       - "--reasoning-parser"
       - "qwen3"
       - "--enable-auto-tool-choice"
@@ -335,7 +341,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 600s   # measured cold start is 341–461s; see note below
+      start_period: 600s   # cold start 341–461s (warm recreate 285–294s); see note below
 
   # ── Anthropic normalizing shim ─────────────────
   # Claude Code injects a system-role message into messages[]; vLLM's native
@@ -411,6 +417,10 @@ A few things worth calling out:
 
 **`--max-num-batched-tokens 8192`** raises the scheduler's per-step token budget from the implicit default of 2048. vLLM warns explicitly that the default starves speculative-decoding draft slots. Honest caveat: the measured gain sits **at the noise floor and is not established** — it is kept because it is the documented-correct setting for a spec-decode configuration, not because we proved it faster.
 
+**`--safetensors-load-strategy prefetch`** parallelises weight loading with a prefetching reader, and is tunable further via `--safetensors-prefetch-num-threads` and `--safetensors-prefetch-block-size`. This replaces vLLM 0.24's `--load-format fastsafetensors`, which does **not** exist on 0.26 — if you are porting a config from an older recipe, that flag is the one that changed name. Load-path only: it cannot affect steady-state decode, and the measured benchmark confirmed no throughput change.
+
+**`--async-scheduling`** overlaps the scheduler step with model execution. **It is not a tuning knob here — vLLM already enables it by default on this configuration**, so adding it changed nothing measurable, exactly as expected. It is kept explicit for a different reason: when the flag is passed, an incompatible configuration raises at startup (`config/vllm.py`, the explicit branch), whereas when it is left unset vLLM silently disables it and logs at `INFO` — which `VLLM_LOGGING_LEVEL=WARNING` suppresses. The auto-enable path requires the speculative method to be in `EagleModelTypes`/`NgramGPUTypes`/`dspark`; `dflash` currently qualifies. Swap to a drafter that does not, or upgrade to a vLLM that narrows the rule, and the explicit flag turns a silent performance regression into a loud startup failure.
+
 **`--speculative-config '{"method":"dflash","model":"/models/Qwen3.6-35B-A3B-DFlash","num_speculative_tokens":4}'`** enables speculative decoding with **DFlash**, a separate 0.77 GB six-layer dense draft model. The draft model proposes 4 candidate tokens per step; vLLM verifies all 4 in a single batched forward pass through the full target model. When candidates are accepted the sequence advances several tokens for the cost of one forward pass.
 
 This is **the single largest tunable win in the stack: +44%** over no speculation (111.4 vs 77.3 tok/s at concurrency 1). Two non-obvious points, both established by measurement in [OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md):
@@ -423,6 +433,8 @@ This is **the single largest tunable win in the stack: +44%** over no speculatio
 **`depends_on: condition: service_healthy`** means Nginx will not start until both vLLM and the shim pass their healthchecks. The `start_period` gives vLLM time to load weights and compile CUDA graphs before the healthcheck begins counting failures.
 
 > **Why 600s and not 300s.** Cold start was measured across ten container recreates at **341–461 seconds**. The old 300s `start_period` plus 5 retries × 30s gave 450s of total grace — *below an observed load time*. A slow start would flip the container to `unhealthy`, and because both Nginx and the shim gate on `service_healthy`, the whole stack would stall behind it. Set this from measured load time, not a guess.
+>
+> **Re-measured 2026-09-13 and deliberately left at 600s.** With `--safetensors-load-strategy prefetch`, a recreate that reuses the `vllm-cache` volume now measures **285–294s** (n=2). That is *not* grounds for lowering the budget: it is a warm-cache figure, and `start_period` has to cover the cold case, which still pays ~117s of torch.compile and FlashInfer autotune on top. Lowering a timeout to fit the fast path is precisely the failure this note was written to prevent.
 
 **`MODEL_PATH` in the volume definition** reads from `.env`. If the variable is unset, it falls back to `/data/models`. The volume bind-mounts that host path into the container at `/models`, which is where the vLLM `--model` flag points.
 
@@ -753,4 +765,4 @@ A 500-token response streams in under 5 seconds.
 | 5 | No TLS on Nginx | High | Add certs if not on a private LAN — all tokens, API keys, and prompt source code are plaintext on :80 |
 | 6 | `restart: "no"` | Medium | Change to `unless-stopped` for production — OOM or CUDA error requires manual recovery. Kept as `no` here so crashes stay visible rather than silently restart-looping; the client-side fallback provider covers availability |
 | 7 | Streaming timeouts | Medium | Tune `proxy_read_timeout` upward if you see 504 errors on long generations |
-| 8 | Cold start 6–8 min | Low | Measured 341–461s across 10 recreates. Wait for the healthcheck — the stack is not broken, it's loading. `start_period` must exceed your slowest observed load |
+| 8 | Cold start 5–8 min | Low | Measured 341–461s cold across 10 recreates; 285–294s on a warm-cache recreate since 2026-09-13. Wait for the healthcheck — the stack is not broken, it's loading. `start_period` must exceed your slowest observed load, which is the **cold** one |

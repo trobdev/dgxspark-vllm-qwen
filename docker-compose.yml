@@ -50,6 +50,15 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - HF_TOKEN=${HF_TOKEN:-}
       - VLLM_LOGGING_LEVEL=WARNING
+      # Cold-start hygiene (Round 1, 2026-09-13). Verified before enabling:
+      # the huggingface-cache volume holds 4 KB and contains no models--* dirs,
+      # and both the checkpoint and the DFlash draft have local config.json under
+      # /models — so nothing resolves from the hub at runtime and offline mode
+      # removes a network dependency from startup without changing what loads.
+      # LAZY defers CUDA module loads until first use.
+      - CUDA_MODULE_LOADING=LAZY
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
       # CUTE_DSL_ARCH=sm_121a was required only for unsloth's cute-DSL b12x path.
       # That checkpoint was benchmarked and rejected (~16% slower here), so the
       # var is inert. See PERFORMANCE_PLAYBOOK.md §3.
@@ -72,6 +81,13 @@ services:
       - "0.0.0.0"
       - "--port"
       - "8000"
+      # Parallel safetensors prefetch during weight load (Round 1, 2026-09-13).
+      # vLLM 0.26 replaced 0.24's `--load-format fastsafetensors` with this
+      # strategy plus tunable --safetensors-prefetch-{num-threads,block-size}.
+      # Targets the measured 341-461s cold start. Load-path only: it cannot
+      # affect steady-state decode, so it is not a throughput lever.
+      - "--safetensors-load-strategy"
+      - "prefetch"
       - "--max-model-len"
       - "262144"
       - "--gpu-memory-utilization"
@@ -85,6 +101,27 @@ services:
       # upstream recipe uses 8192.
       - "--max-num-batched-tokens"
       - "8192"
+      # Async scheduling (Round 2, 2026-09-13). NOT A PERFORMANCE CHANGE — it was
+      # ALREADY ON. vLLM 0.26 auto-enables it when nothing is incompatible, and
+      # nothing here is. Verified in config/vllm.py:1095-1141 on this build:
+      #   async_scheduling defaults to None (config/scheduler.py:148); when None,
+      #   vLLM enables it unless the model is pooling, the executor refuses, it is
+      #   ROCm DeepEP, disable_padded_drafter_batch is set (defaults False), or the
+      #   spec method is outside EagleModelTypes/NgramGPUTypes/dspark.
+      #   'dflash' IS in EagleModelTypes, and UniProcExecutor (TP=1) returns True
+      #   from supports_async_scheduling. So the None path resolved to True, and
+      #   the baseline measurement below already included async scheduling.
+      # Kept explicit deliberately, as a FAIL-LOUD GUARD, not a tuning knob: with
+      # the flag set, an incompatible future change (a vLLM upgrade that narrows
+      # the heuristic, or swapping dflash for a non-Eagle drafter) RAISES at
+      # startup (same file, the explicit branch at :1081-1095) instead of silently
+      # reverting to synchronous scheduling. Compare the compression.threshold
+      # 0.75-floor bug in Hermes: a setting that looks right while doing nothing
+      # is the expensive failure mode here, so prefer the flag that errors.
+      # Measured effect of adding it: none. n=14 before/after (functionally identical
+      # configs) came out 115.9 -> 118.6 tok/s at c=1 and 229.1 -> 245.4 at c=4 — i.e. the
+      # apparent "+7% at c=4" is pure run-to-run noise. See PERFORMANCE_PLAYBOOK.md S8.2.
+      - "--async-scheduling"
       - "--reasoning-parser"
       - "qwen3"
       - "--enable-auto-tool-choice"

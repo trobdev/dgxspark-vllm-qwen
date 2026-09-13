@@ -38,7 +38,8 @@ sweep.CONFIGS = [("dflash4", {"method": "dflash", "model": "...", "num_speculati
 sweep.main()
 ```
 
-Note cold start is 341-461s per config, so a 4-config sweep takes ~40 minutes.
+Note each config change costs a full container recreate — 285-294s with the `vllm-cache`
+volume warm, 341-461s if it is cold — so a 4-config sweep takes ~30 minutes.
 
 ## `validate.py`
 
