@@ -12,7 +12,8 @@ OpenAI-compatible clients connect directly through Nginx — they bypass the shi
 because vLLM speaks OpenAI natively.
 
 **Model:** `nvidia/Qwen3.6-35B-A3B-NVFP4` — 35B MoE (3B active), Blackwell NVFP4, 256K context, tool-calling,
-with DFlash speculative decoding (~111 tok/s single-stream, ~228 tok/s at 4 concurrent).
+with DFlash speculative decoding (~112 tok/s single-stream, ~235 tok/s at 4 concurrent —
+see [Measured performance](#measured-performance)).
 The stack is model-agnostic; see [Swapping the model](#swapping-the-model) to use a different one.
 
 **Primary workload:** [Hermes Agent](OPTIMIZATION_REPORT.md), running on the host and
@@ -32,6 +33,53 @@ tool-call and code-edit heavy, which is what selected DFlash speculative decodin
 | [OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md) | What was tested, how it was measured, results, and why each setting was chosen |
 | [PERFORMANCE_PLAYBOOK.md](PERFORMANCE_PLAYBOOK.md) | Ranked tuning levers, negative results, and how to evaluate a new model |
 | [bench/](bench/) | Benchmark harness, config sweeper, and the functional validation suite |
+
+## Measured performance
+
+GIGABYTE AI TOP ATOM (GB10, 128 GB unified, driver 580.173.02), vLLM 0.30.0, the config in
+`docker-compose.yml` as shipped. Measured 2026-10-04, n=14 per workload.
+
+**Decode rate by workload** — single request (c=1), tokens/sec:
+
+| Workload | tok/s | What it represents |
+|---|---|---|
+| `code_edit` | 121.7 | modify a file, reproduce surrounding context |
+| `tool_call` | 115.8 | agentic tool invocation, JSON arguments |
+| `reasoning` | 109.0 | general analysis |
+| `prose` | 99.0 | novel, unpredictable text |
+| **Headline (median of medians)** | **112.4** | |
+| **4 concurrent requests, aggregate** | **234.8** | |
+
+Speculative acceptance: **53.0%** (DFlash, 4 draft tokens).
+
+**What the tuning bought** — same hardware, same model (vLLM 0.26.1, n=14 for finalists):
+
+| Configuration | c=1 tok/s | c=4 aggregate |
+|---|---|---|
+| No speculative decoding | 77.3 | 181.3 |
+| DFlash, 15 draft tokens (upstream recipe default) | 104.8 | 174.3 |
+| MTP, 3 draft tokens | 108.9 | 208.8 |
+| **DFlash, 4 draft tokens (deployed)** | **111.4** | **227.8** |
+
+The upstream default draft length was *slower than no speculation at all* at c=4. Upgrading
+vLLM 0.26.1 → 0.30.0 changed nothing measurable (every delta inside the noise floor).
+
+**Other measured figures:**
+
+| | |
+|---|---|
+| Long-context recall | 241,815-token prompt, specific line retrieved verbatim |
+| Cold start (container start → serving) | 341–461s; 347s on the first 0.30.0 start |
+| Warm recreate (`vllm-cache` volume populated) | 285–294s |
+| GPU memory committed | ~91 GiB of ~121 GiB usable (`--gpu-memory-utilization 0.75`) |
+
+**How these were measured:** decode rate only — streamed, with time-to-first-token excluded so
+prefill and prefix-cache hits don't inflate the number; temperature 0; prompts drawn from a
+real agent workload rather than a synthetic benchmark; medians over n trials. Run-to-run
+noise is about ±2–3% at c=1 and ±7% at c=4, so smaller differences are not meaningful.
+Workload choice matters more than most config changes — note the ~20% spread between `prose`
+and `code_edit` on identical settings. Reproduce with `python3 bench/bench_hermes.py <label> 14`;
+full method and history in [OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md).
 
 ## Prerequisites
 
