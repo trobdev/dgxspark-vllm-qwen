@@ -189,18 +189,20 @@ The official vLLM Docker image does not include kernels built for the GB10 Black
 ```bash
 git clone https://github.com/eugr/spark-vllm-docker
 cd spark-vllm-docker
-./build-and-copy.sh
+./build-and-copy.sh -t vllm-node-v2
 ```
 
-> **Risk — Build Time:** With prebuilt wheels the build typically takes ~15–20 minutes. If you force a from-source build (e.g. `--rebuild-vllm` or a custom `--vllm-ref`), it compiles CUDA kernels for Blackwell and can take 30–60 minutes — do not interrupt that, as a partial kernel compilation leaves a broken image.
+> **Risk — Build Time:** With prebuilt wheels the build typically takes ~15–20 minutes. If you force a from-source build (e.g. `--rebuild-vllm` or a custom `--vllm-ref`), it compiles CUDA kernels for Blackwell and can take 30–60 minutes (v0.30.0 at `-j 8` measured 39m42s) — do not interrupt that, as a partial kernel compilation leaves a broken image.
 
-> **Risk — Image Tag:** The `docker-compose.yml` hardcodes `vllm-node-v2:latest`. If you tag the image differently during the build, update the compose file before proceeding.
+> **Risk — Build Memory:** A from-source compile shares unified memory with anything else running. With vLLM resident (~91 GiB committed) an `-j 8` build drove the box into the kernel OOM killer twice; with vLLM stopped the same build completed cleanly. Stop `vllm-coding` before a from-source build, or lower `-j`.
+
+> **Risk — Image Tag:** The `docker-compose.yml` hardcodes `vllm-node-v2:latest`, but `build-and-copy.sh` defaults to the tag `vllm-node` — always pass `-t vllm-node-v2`. Rebuilding reuses that tag and leaves the previous image untagged, so `docker tag vllm-node-v2:latest vllm-node:v2-previous` first if you want a one-line rollback.
 
 Verify the build succeeded and vLLM reports the correct version:
 
 ```bash
 docker run --rm --runtime=nvidia vllm-node-v2:latest python3 -c "import vllm; print(vllm.__version__)"
-# Must print 0.19 or higher
+# Must print 0.19 or higher (deployed: 0.30.1.dev1+gbf1979fbd)
 ```
 
 ---

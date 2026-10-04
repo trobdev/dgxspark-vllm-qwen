@@ -108,21 +108,26 @@ architecture.
 cd ~
 git clone https://github.com/eugr/spark-vllm-docker.git
 cd spark-vllm-docker
-./build-and-copy.sh
+./build-and-copy.sh -t vllm-node-v2
 ```
+
+**Pass `-t vllm-node-v2`.** The script's default tag is `vllm-node`, but `docker-compose.yml`
+runs `vllm-node-v2:latest` — without the flag the build succeeds and the stack can't find it.
 
 **Do not run `docker build` directly** — the Dockerfile requires a `build-metadata.yaml`
 that only `build-and-copy.sh` generates. The script also auto-downloads prebuilt
 FlashInfer and vLLM wheels from the repo's GitHub releases before building the runner
 image, which means for the DGX Spark's `12.1a` architecture (GB10 = sm_121) it skips
 the full compile entirely and just assembles the final image — typically 15–20 minutes
-instead of several hours.
+instead of several hours. Pinning a release with `--vllm-ref <tag>` compiles from source
+instead (v0.30.0 at `-j 8`: 39m42s). Stop any running vLLM container first — a from-source
+compile next to a resident model can exhaust unified memory.
 
 Once complete, the repo directory is no longer needed. The image lives in Docker's store.
 
 Verify the build succeeded and is tagged correctly:
 ```bash
-docker images vllm-node
+docker images vllm-node-v2
 ```
 
 ---
@@ -322,9 +327,11 @@ If vLLM fails to load the NVFP4 weights or reports unsupported quantization/kern
 your `vllm-node-v2:latest` image predates NVFP4/Blackwell support. Rebuild it:
 
 ```bash
+docker tag vllm-node-v2:latest vllm-node:v2-previous   # rollback — the build reuses the tag
+docker compose -f ~/llm-stack/docker-compose.yml stop vllm-coding
 cd ~/spark-vllm-docker
 git pull
-./build-and-copy.sh
+./build-and-copy.sh -t vllm-node-v2
 docker compose -f ~/llm-stack/docker-compose.yml up -d --force-recreate vllm-coding
 ```
 

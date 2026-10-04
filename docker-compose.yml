@@ -22,10 +22,16 @@ services:
 
   # ── Qwen3.6-35B-A3B-NVFP4 coding model ───────
   vllm-coding:
-    # Phase A (v2): vLLM 0.26.1rc1.dev247 / FlashInfer 0.6.17, built locally via
-    # eugr/spark-vllm-docker (f7d6e3b) with --use-wheels. Runs directly on driver
-    # 580.173.02 (torch 2.11.0+cu130, CUDA 13.0 — no compat layer needed).
-    # ROLLBACK: change this back to vllm-node:v1-0.22.1rc1 and `docker compose up -d`.
+    # vLLM 0.30.1.dev1+gbf1979fbd (v0.30.0 + preset PRs) / FlashInfer 0.7.1, built
+    # from source via eugr/spark-vllm-docker (f7d6e3b) on 2026-10-04:
+    #   ./build-and-copy.sh -t vllm-node-v2 --vllm-ref v0.30.0 --apply-preset-vllm-prs -j 8
+    # Runs directly on driver 580.173.02 (torch 2.11.0+cu130, CUDA 13.0 — no compat
+    # layer needed). Re-validated 7/7 and benchmarked at parity with 0.26.1 — see
+    # OPTIMIZATION_REPORT.md §6.2.
+    # ROLLBACK: build-and-copy.sh REUSES the vllm-node-v2 tag, so the previous build
+    # is left untagged. Tag it before rebuilding (`docker tag vllm-node-v2:latest
+    # vllm-node:v2-0.26.1`), then set `image:` to that tag and `docker compose up -d`.
+    # Older fallback: vllm-node:v1-0.22.1rc1.
     image: vllm-node-v2:latest
     container_name: vllm-coding
     runtime: nvidia

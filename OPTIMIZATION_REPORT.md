@@ -348,6 +348,51 @@ separation, **241,815-token context recall** (retrieved a specific line verbatim
 `/v1/messages` through nginx and the normalizing shim with `thinking` blocks preserved, SSE
 streaming, and model metadata.
 
+### 6.2 Addendum — 2026-10-04 vLLM 0.30.0 upgrade
+
+**Image only; no flag or config changes.** vLLM `0.30.1.dev1+gbf1979fbd` (v0.30.0 plus the
+build repo's preset PRs), FlashInfer 0.6.17 → **0.7.1**, torch 2.11.0+cu130 / CUDA 13.0
+unchanged, driver unchanged. Built from source:
+`./build-and-copy.sh -t vllm-node-v2 --vllm-ref v0.30.0 --apply-preset-vllm-prs -j 8`
+(39m42s).
+
+**Benchmark, n=14, same harness and config, against the DFlash@4 reference in §5.1–5.2:**
+
+| | 0.26.1 | 0.30.0 | change |
+|---|---|---|---|
+| `tool_call` | 120.9 | 115.8 | −4.2% |
+| `code_edit` | 121.0 | 121.7 | +0.6% |
+| `prose` | 99.5 | 99.0 | −0.5% |
+| `reasoning` | 104.6 | 109.0 | +4.2% |
+| **c=1 median-of-medians** | 111.4 | **112.4 tok/s** | +0.9% |
+| **c=4 aggregate** | 227.8 | **234.8 tok/s** | +3.1% |
+| acceptance | 53.1% | **53.0%** | — |
+
+**Verdict: parity.** Every delta sits inside the noise characterised in
+[PERFORMANCE_PLAYBOOK.md §8](PERFORMANCE_PLAYBOOK.md) — the largest, `tool_call` −4.2%, came
+with a 20% within-run spread, and the two identical-config runs in §6.1 already differed by
++2.3% at c=1 and +7.1% at c=4. Unchanged acceptance confirms DFlash is behaving identically.
+This is consistent with §2's model of the machine: decode is bandwidth-bound, and a serving-
+framework upgrade does not change bytes per token.
+
+**Validated 7/7**, including 241,815-token context recall and `thinking` blocks through the
+shim. The reasoning field is still named `reasoning`.
+
+**First start: 347s** (container start → `Application startup complete`), inside the
+341–461s cold range in §5.5. The FlashInfer autotune cache is stored per FlashInfer version
+(`flashinfer_autotune_cache/0.6.17/`, `/0.7.1/`), so the first start after this upgrade
+autotuned into a new directory (~26s, 63 configs) despite the warm `vllm-cache` volume; later
+starts reuse it. The orphaned `0.6.17/` directory is safe to delete.
+
+**New startup warnings, all benign here:**
+- `Speculative decoding (method=dflash) is enabled but no KV cache group could be identified
+  as the draft model's` — reads as a misconfiguration, but acceptance is unchanged (53.0%).
+- `Triton kernel JIT compilation during inference` for the DFlash/rejection kernels — a
+  one-time latency spike on the first requests after each start.
+- `python -m vllm.entrypoints.openai.api_server` is deprecated in favour of `vllm serve`.
+  Still works; migrate before it is removed.
+- `Failed to import the DeepSelect extension` — not used by this model.
+
 ---
 
 ## 7. What generalizes

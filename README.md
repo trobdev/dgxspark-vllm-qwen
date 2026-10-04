@@ -180,7 +180,7 @@ Model name: `coding`, API key: `none`.
 | View live logs          | `docker compose logs -f vllm-coding`          |
 | Check GPU usage         | `nvidia-smi`                                  |
 | Health check            | `curl http://localhost:8001/health`           |
-| Update vLLM image       | `cd ~/spark-vllm-docker && git pull && ./build-and-copy.sh` |
+| Update vLLM image       | See [Important: vLLM image requirement](#important-vllm-image-requirement) |
 
 ---
 
@@ -245,4 +245,22 @@ single developer or a trusted LAN.
 NVFP4 quantization on the GB10 Blackwell architecture requires **vLLM ≥ 0.19**.
 The `vllm-node-v2:latest` image must be rebuilt from `eugr/spark-vllm-docker` if your existing
 build predates NVFP4 support. See [SETUP_GUIDE.md](SETUP_GUIDE.md) for rebuild instructions.
-The deployed build is `0.26.1rc1.dev247+ge92dc7a9c`.
+The deployed build is `0.30.1.dev1+gbf1979fbd` (vLLM v0.30.0 plus the build repo's preset PRs,
+FlashInfer 0.7.1), validated 2026-10-04 — see
+[OPTIMIZATION_REPORT.md §6.2](OPTIMIZATION_REPORT.md).
+
+To update it:
+
+```bash
+docker tag vllm-node-v2:latest vllm-node:v2-previous   # keep a rollback — the build reuses the tag
+docker compose stop vllm-coding                        # free ~91 GiB before a from-source compile
+cd ~/spark-vllm-docker && git pull
+./build-and-copy.sh -t vllm-node-v2 --vllm-ref <tag> --apply-preset-vllm-prs -j 8
+cd ~/llm-stack && docker compose up -d && python3 bench/validate.py
+```
+
+`-t vllm-node-v2` is required: the script's default tag is `vllm-node`, which this compose
+file does not use. Stopping vLLM first matters — a from-source build at `-j 8` next to a
+resident model (~91 GiB committed) triggered the kernel OOM killer twice during the
+2026-10-04 upgrade. With the model stopped, the same build completed with no OOM events
+in 39m42s.

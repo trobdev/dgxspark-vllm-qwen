@@ -52,8 +52,8 @@ through nginx + the normalizing shim (confirms `thinking` blocks survive), and S
 
 Two gotchas it encodes, both of which cost debugging time:
 
-- vLLM 0.26.1 names the reasoning field **`reasoning`**, not `reasoning_content`. Checking
-  the old name makes a working parser look broken.
+- vLLM 0.26.1 and later (re-checked on 0.30.0) name the reasoning field **`reasoning`**, not
+  `reasoning_content`. Checking the old name makes a working parser look broken.
 - This is a reasoning model: if `max_tokens` is smaller than the thinking block, `content`
   comes back **empty** — the budget is consumed before `</think>`. Use
   `chat_template_kwargs: {"enable_thinking": false}` for pure-retrieval calls.

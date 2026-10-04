@@ -4,6 +4,10 @@ Derived from measured results on 2026-08-03 (GIGABYTE AI TOP ATOM, GB10, 128 GB 
 driver 580.173.02, vLLM 0.26.1rc1). Written to be reused for future model upgrades
 (Qwen3.8, etc.) rather than re-derived each time.
 
+**Re-validated on vLLM 0.30.0 (2026-10-04):** throughput at parity with 0.26.1 on every
+workload, unchanged acceptance, same config — so the levers and negative results below still
+hold. Numbers in [OPTIMIZATION_REPORT.md §6.2](OPTIMIZATION_REPORT.md).
+
 ---
 
 ## 0. The one-paragraph model of this machine
@@ -281,6 +285,19 @@ be on. Read the resolution logic; a benchmark cannot tell these apart from "no e
 **8. Validate correctness, not just speed.** Coherence, tool calling, thinking blocks
 through the shim, and long-context recall (FP8 KV clipping shows up as degraded recall,
 not as an error).
+
+**9. Don't trust a hand-rolled smoke test on a reasoning model.** On 2026-10-04 a quick
+`curl` with `max_tokens: 32` came back `content: null`, `finish_reason: length` — all 32
+tokens went to thinking, which reads like a server-side "reasoning budget" limit but is not.
+Qwen3.6 spends ~220 reasoning tokens even on "say ok". Adding `"reasoning": {"effort":
+"disabled"}` does **nothing** here (measured: 235 reasoning tokens with it, 220 without);
+`"chat_template_kwargs": {"enable_thinking": false}` is the switch that works (0 reasoning
+tokens). Use `bench/validate.py`, which already accounts for this, rather than ad-hoc probes.
+
+**10. Protect the rollback image before rebuilding.** `build-and-copy.sh` reuses the target
+tag, leaving the previous build untagged and one `docker image prune` away from deletion.
+`docker tag vllm-node-v2:latest vllm-node:v2-previous` first, and stop vLLM before any
+from-source compile (see IMPLEMENTATION_GUIDE.md, *Risk — Build Memory*).
 
 ---
 
