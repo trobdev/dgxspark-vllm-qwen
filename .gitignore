@@ -1,9 +1,6 @@
 # Secrets — never commit
 .env
 
-# Local agent/tooling config
-.claude/
-
 # TLS private keys and certificates (dir is auto-created by Docker on `up`)
 nginx/certs/
 
@@ -21,23 +18,11 @@ bench/res_*.json
 bench/*.log
 bench/docker-compose.yml.orig
 
-# Shelved work — kept on disk so it stays recoverable, deliberately not part of
-# this repo. This stack is scoped to ONE model (Qwen3.6-35B-A3B-NVFP4) and the
-# work needed to run it well; evaluations of other models, model-swap tooling,
-# and comparison-only benchmark harnesses live here instead.
-#
-# Do not un-ignore this directory wholesale: some of its contents are local
-# evaluation captures containing private data that must not be published.
-archive/
-
-# Local evaluation notes — analysis scratch, not part of the documented stack
-STACK_EVALUATION_*.md
-
-# Hermes agent postmortems — about the PA layer, not this stack; contains
-# infra/account specifics that shouldn't be published
-HERMES_POSTMORTEM_*.md
-
 # Python / OS cruft
 __pycache__/
 *.pyc
 .DS_Store
+
+# Local backups of edited files (e.g. docker-compose.yml.bak.*)
+*.bak
+*.bak.*

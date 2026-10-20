@@ -1,55 +1,55 @@
 # DGX Spark LLM Stack — Setup Guide
 
-End-to-end setup from a fresh DGX Spark to a running Qwen3.6-35B-A3B-NVFP4 inference server
-accessible from your network, with Claude Code integration.
+This guide takes a fresh DGX Spark to a running Qwen3.6-35B-A3B-NVFP4 inference server
+that your network can reach, with Claude Code connected. It follows the same steps as the
+[README quick start](README.md#quick-start), adding a verification command at each step
+and a troubleshooting section.
 
-**Estimated time:** 1–2 hours (dominated by model download and Docker image build)
+**Estimated time:** 1–1.5 hours, mostly the vLLM image build (~40 min) and the model download.
 
 ---
 
 ## Prerequisites
 
-- Ubuntu 22.04 or 24.04
-- Internet access from the DGX Spark
-- ~50 GB free disk space (30 GB model + Docker image overhead)
-- User with `sudo` privileges
+- **Hardware:** NVIDIA GB10 with 128 GB unified memory (DGX Spark or an OEM equivalent).
+- **OS:** DGX OS, which is Ubuntu 24.04-based, or Ubuntu 24.04 with the NVIDIA 580.x driver.
+- **Network:** internet access from the Spark.
+- **Disk:** ~50 GB free (~23 GB of models plus a ~25 GB image).
+- **Access:** a user with `sudo`.
 
 ---
 
 ## Phase 1 — System dependencies
 
-> **On a stock DGX Spark, you can skip almost all of Phase 1.** A factory DGX Spark runs
-> DGX OS (an Ubuntu 24.04-based image) that ships with the NVIDIA driver, CUDA toolkit,
-> cuDNN, and TensorRT preinstalled, plus **Docker Engine and the NVIDIA Container Toolkit /
-> Container Runtime preinstalled and already configured** — NVIDIA describes it as "ready to
-> use out of the box." Verify what's present before installing anything:
+> **On a stock DGX Spark you can skip almost all of Phase 1.** DGX OS ships with the NVIDIA
+> driver, CUDA, Docker Engine, and the NVIDIA Container Toolkit, all preinstalled and
+> configured. Check before installing anything:
 >
 > ```bash
 > docker --version            # Docker Engine present
+> docker compose version      # Compose v2 present
 > nvidia-ctk --version        # NVIDIA Container Toolkit present
-> nvidia-smi                  # Host driver — confirm 580.x (required for NVFP4)
+> nvidia-smi                  # Driver: must be 580.x (required for NVFP4)
 > docker run --rm --gpus=all \
 >   nvcr.io/nvidia/cuda:13.0.1-devel-ubuntu24.04 nvidia-smi   # GPU visible in containers
 > ```
 >
-> If all four succeed, **skip to [Phase 2 — Build the vLLM image](#phase-2--build-the-vllm-image).**
-> The install steps below (Steps 1–2) are only needed on a re-imaged machine or a non-DGX-OS
-> system where these components are missing.
+> If all five succeed, **skip to [Phase 2](#phase-2--build-the-vllm-image).** Steps 1–2
+> below are only for a re-imaged machine or a non-DGX-OS install.
+>
+> **Do not update the GPU driver.** On a DGX Spark the driver is part of the platform image.
 
 ### Step 1: Install Docker Engine (only if missing)
 
 ```bash
-sudo apt-get remove -y docker docker-engine docker.io containerd runc
-
 sudo apt-get update
-sudo apt-get install -y ca-certificates curl gnupg
+sudo apt-get install -y ca-certificates curl
 sudo install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-  | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-sudo chmod a+r /etc/apt/keyrings/docker.gpg
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
 
 echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
   https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
   | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 
@@ -57,18 +57,10 @@ sudo apt-get update
 sudo apt-get install -y docker-ce docker-ce-cli containerd.io \
   docker-buildx-plugin docker-compose-plugin
 
-sudo usermod -aG docker $USER
-newgrp docker
+sudo usermod -aG docker $USER     # then log out and back in
 ```
 
-Verify:
-```bash
-docker --version
-```
-
----
-
-### Step 2: Install NVIDIA Container Toolkit (only if missing)
+### Step 2: Install the NVIDIA Container Toolkit (only if missing)
 
 ```bash
 curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
@@ -89,73 +81,71 @@ Verify the GPU is visible in containers:
 docker run --rm --runtime=nvidia --gpus all ubuntu nvidia-smi
 ```
 
-You should see your GB10 Grace Blackwell listed. If this fails, resolve the NVIDIA
-toolkit issue before continuing.
-
 ---
 
 ## Phase 2 — Build the vLLM image
 
-The DGX Spark requires a custom vLLM build (`eugr/spark-vllm-docker`) due to the GB10's
-driver stack. The image must be **vLLM ≥ 0.19** for NVFP4 support on the Blackwell
-architecture.
+The GB10 (`sm_121`) needs a vLLM build with Blackwell and NVFP4 kernels. Build one with
+[`eugr/spark-vllm-docker`](https://github.com/eugr/spark-vllm-docker). The image runs on
+the stock 580.x driver, so no driver changes are needed.
 
-> **No driver modifications required.** Driver 580.x is fully compatible. This is a
-> Docker image build only.
+**This compose file needs vLLM 0.26 or newer** (DFlash speculative decoding and
+`--safetensors-load-strategy`). It was validated on **v0.30.0**, and the command below
+reproduces that build:
 
 ```bash
-# Clone anywhere — this repo is only needed for the build, not for running the stack
-cd ~
-git clone https://github.com/eugr/spark-vllm-docker.git
-cd spark-vllm-docker
-./build-and-copy.sh -t vllm-node-v2
+git clone https://github.com/eugr/spark-vllm-docker.git ~/spark-vllm-docker
+cd ~/spark-vllm-docker
+git checkout f7d6e3b       # build-script version used for the validated image
+./build-and-copy.sh -t vllm-node-v2 --vllm-ref v0.30.0 --apply-preset-vllm-prs -j 8
 ```
 
-**Pass `-t vllm-node-v2`.** The script's default tag is `vllm-node`, but `docker-compose.yml`
-runs `vllm-node-v2:latest` — without the flag the build succeeds and the stack can't find it.
+- **Time:** it compiles vLLM from source, which measured **39m42s**. Don't interrupt it,
+  because a partial build leaves a broken image.
+- **`-t vllm-node-v2` is required.** The script's default tag is `vllm-node`, but
+  `docker-compose.yml` runs `vllm-node-v2:latest`. Without the flag the build succeeds and
+  then the stack can't find the image.
+- **Use the script, not `docker build`.** The Dockerfile needs a `build-metadata.yaml` that
+  only `build-and-copy.sh` generates.
+- **FlashInfer comes from the build repo's prebuilt wheel**, which was 0.7.1 at validation
+  time. Add `--flashinfer-ref v0.7.1` to pin it too, at the cost of a FlashInfer source build.
+- **Unpinned alternative:** `./build-and-copy.sh -t vllm-node-v2` downloads the build
+  repo's current prebuilt vLLM and FlashInfer wheels instead of compiling. It takes ~15–20
+  minutes but gives a version not validated here, so run `bench/validate.py` after Phase 5.
+- **Memory:** a source build shares unified memory with everything else. Next to a resident
+  model (~91 GiB) an `-j 8` build triggered the OOM killer, so keep vLLM stopped while building.
 
-**Do not run `docker build` directly** — the Dockerfile requires a `build-metadata.yaml`
-that only `build-and-copy.sh` generates. The script also auto-downloads prebuilt
-FlashInfer and vLLM wheels from the repo's GitHub releases before building the runner
-image, which means for the DGX Spark's `12.1a` architecture (GB10 = sm_121) it skips
-the full compile entirely and just assembles the final image — typically 15–20 minutes
-instead of several hours. Pinning a release with `--vllm-ref <tag>` compiles from source
-instead (v0.30.0 at `-j 8`: 39m42s). Stop any running vLLM container first — a from-source
-compile next to a resident model can exhaust unified memory.
-
-Once complete, the repo directory is no longer needed. The image lives in Docker's store.
-
-Verify the build succeeded and is tagged correctly:
+Verify:
 ```bash
-docker images vllm-node-v2
+docker run --rm --runtime=nvidia vllm-node-v2:latest \
+  python3 -c "import vllm, flashinfer; print(vllm.__version__, flashinfer.__version__)"
+# validated build prints: 0.30.1.dev1+gbf1979fbd... 0.7.1
 ```
+
+Once the image is built, `~/spark-vllm-docker` is only needed for future rebuilds.
 
 ---
 
 ## Phase 3 — Project setup
 
-### Step 3: Configure the environment
-
-Create your `.env` from the provided template and add your HuggingFace token:
-
 ```bash
-cd ~/llm-stack
+git clone https://github.com/trobdev/dgxspark-vllm-qwen.git ~/dgxspark-vllm-qwen
+cd ~/dgxspark-vllm-qwen
 cp .env.example .env
+sed -i "s/^LLM_API_KEY=.*/LLM_API_KEY=$(openssl rand -hex 32)/" .env
 ```
 
-Then edit `.env` and set your values:
+Check `.env`:
+```bash
+cat .env | grep -v '^#'
+# LLM_API_KEY=<64 hex characters>   required; clients send this
+# MODEL_PATH=/data/models           where weights are stored
+# HF_TOKEN=                         optional; both models are public
 ```
-MODEL_PATH=/data/models
-HF_TOKEN=hf_your_token_here
-```
 
-Generate a token at https://huggingface.co/settings/tokens, and accept the model
-license on the [model's HuggingFace page](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4)
-first — the repo is gated and the download will 403 otherwise.
+> `.env` is gitignored. Never commit it.
 
-> `.env` is gitignored. Never commit your real token.
-
-Ensure the model directory exists:
+Create the model directory:
 ```bash
 sudo mkdir -p /data/models
 sudo chown $USER:$USER /data/models
@@ -166,17 +156,26 @@ sudo chown $USER:$USER /data/models
 ## Phase 4 — Download model weights
 
 ```bash
-chmod +x ~/llm-stack/download-models.sh
-cd ~/llm-stack
+cd ~/dgxspark-vllm-qwen
 ./download-models.sh
 ```
 
-This downloads `nvidia/Qwen3.6-35B-A3B-NVFP4` (~22 GB). The script skips models
-already present, so it is safe to interrupt and re-run if the connection drops.
+This downloads two public (Apache-2.0) models to `MODEL_PATH`:
 
-Verify the download:
+| Model | Size | Role |
+|---|---|---|
+| `nvidia/Qwen3.6-35B-A3B-NVFP4` | ~22 GB | the served model |
+| `z-lab/Qwen3.6-35B-A3B-DFlash` | ~0.8 GB | speculative-decoding draft model; required by the shipped config |
+
+The script reads `.env`. It uses the `hf` CLI if it's installed; otherwise it runs it in a
+throwaway `python:3.12-slim` container, because DGX OS's system Python refuses
+`pip install`. If the download is interrupted, re-run the script and it resumes.
+
+Verify:
 ```bash
-ls /data/models/Qwen3.6-35B-A3B-NVFP4/
+ls /data/models/
+# Qwen3.6-35B-A3B-DFlash  Qwen3.6-35B-A3B-NVFP4
+du -sh /data/models/*
 ```
 
 ---
@@ -184,111 +183,100 @@ ls /data/models/Qwen3.6-35B-A3B-NVFP4/
 ## Phase 5 — Start the stack
 
 ```bash
-cd ~/llm-stack
+cd ~/dgxspark-vllm-qwen
 docker compose up -d
-```
-
-Watch the model load:
-```bash
 docker compose logs -f vllm-coding
 ```
 
-A healthy first startup measures 341–461s — it is genuinely cold, so it pays torch.compile
-and FlashInfer autotune in full (weights load, the KV cache pool is allocated, and CUDA
-graphs compile; the healthcheck allows 600s). Later recreates reuse the `vllm-cache` volume
-and measure 285–294s. Startup ends with:
+A first start takes **341–461s**. It loads weights, allocates the KV cache pool, compiles
+CUDA graphs, and runs FlashInfer autotuning. Later restarts reuse the `vllm-cache` volume
+and take 285–294s. The healthcheck allows 600s before it counts failures. Startup ends with:
+
 ```
 INFO:     Application startup complete.
-INFO:     Uvicorn running on http://0.0.0.0:8000
 ```
 
-Verify both services are healthy:
+Check that all three services are healthy. nginx and the shim start only after vLLM is healthy:
+
 ```bash
 docker compose ps
+# vllm-coding, anthropic-shim and nginx should all show (healthy)
 ```
 
-Test the API:
-```bash
-curl http://localhost:8001/health
+Then test the API directly on the host, then through nginx with your key:
 
-curl http://localhost:8001/v1/chat/completions \
+```bash
+curl http://localhost:8001/health      # direct vLLM, loopback only, no key
+
+KEY=$(grep ^LLM_API_KEY= .env | cut -d= -f2)
+curl http://localhost/coding/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "coding",
     "messages": [{"role": "user", "content": "Say hello in one sentence."}],
-    "max_tokens": 50
+    "max_tokens": 50,
+    "chat_template_kwargs": {"enable_thinking": false}
   }'
+```
+
+`enable_thinking: false` matters for a quick test. This is a reasoning model, so with a
+small `max_tokens` and thinking on, the whole budget goes to reasoning and `content`
+comes back empty.
+
+Finally, run the full validation suite:
+
+```bash
+python3 bench/validate.py     # expect 7/7 passed
 ```
 
 ---
 
-## Phase 6 — Claude Code integration
+## Phase 6 — Connect Claude Code and other clients
 
-Claude Code can be pointed at the local vLLM server instead of (or alongside) Anthropic's
-API. The switch is done entirely via environment variables — no config file editing needed.
-
-### Add shell aliases
-
-In `~/.bashrc` or `~/.zshrc`:
+See [README → Connecting clients](README.md#connecting-clients). The short version for Claude Code:
 
 ```bash
-# Local DGX model — overrides Anthropic API endpoint at Claude Code startup
-alias claude-local='ANTHROPIC_BASE_URL=http://<dgx-ip>/coding \
-  ANTHROPIC_API_KEY=none \
+alias claude-local='env -u ANTHROPIC_API_KEY \
+  ANTHROPIC_BASE_URL=http://<dgx-ip>/coding \
+  ANTHROPIC_AUTH_TOKEN=<LLM_API_KEY> \
   ANTHROPIC_DEFAULT_OPUS_MODEL=coding \
   ANTHROPIC_DEFAULT_SONNET_MODEL=coding \
   ANTHROPIC_DEFAULT_HAIKU_MODEL=coding \
   claude'
-
-# Anthropic SaaS — uses your real ANTHROPIC_API_KEY from the environment
-alias claude-saas='claude'
 ```
 
-Replace `<dgx-ip>` with your DGX Spark's IP address (find it with `ip addr show`).
+`<dgx-ip>` is the Spark's address (`hostname -I`), or `localhost` if Claude Code runs on the
+Spark. Claude Code requests `/coding/v1/messages`. nginx checks the key and routes the
+request to the shim, which moves Claude Code's `system`-role messages into the top-level
+`system` field before forwarding to vLLM.
 
-Reload your shell:
+**Don't point Claude Code at port 8001 directly.** That skips the shim, and vLLM returns 400
+for the `system`-role messages.
+
+Verify with a real request:
 ```bash
-source ~/.bashrc   # or ~/.zshrc
-```
-
-### How it works
-
-- `ANTHROPIC_BASE_URL` redirects all Claude API calls to your vLLM server.
-  vLLM exposes both an OpenAI-compatible endpoint (`/v1/chat/completions`) and an
-  Anthropic-compatible endpoint (`/v1/messages`) on the same port.
-- The `ANTHROPIC_*_MODEL` vars map Claude Code's internal model names (opus, sonnet, haiku)
-  to the served model name `coding` so vLLM recognizes the request.
-- `ANTHROPIC_BASE_URL` is read once at Claude Code startup. To switch endpoints,
-  exit and relaunch with the other alias.
-
-### Verify Claude Code can reach the model
-
-```bash
-claude-local --version   # should start without auth errors
-```
-
-Then ask it something:
-```bash
-claude-local "Write a Python function that reverses a linked list"
+claude-local -p "Reply with exactly: LOCAL-OK"
 ```
 
 ---
 
 ## Phase 7 — Optional: system autostart
 
-To start the stack automatically after a reboot:
+Run this from the repository directory, so that `$PWD` expands to the right path:
 
 ```bash
+cd ~/dgxspark-vllm-qwen
 sudo tee /etc/systemd/system/llm-stack.service > /dev/null <<EOF
 [Unit]
 Description=DGX Spark LLM Stack
-After=docker.service
+After=docker.service network-online.target
 Requires=docker.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-WorkingDirectory=/home/$USER/llm-stack
+WorkingDirectory=$PWD
 ExecStart=/usr/bin/docker compose up -d
 ExecStop=/usr/bin/docker compose down
 User=$USER
@@ -298,16 +286,32 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable llm-stack
+sudo systemctl enable --now llm-stack
 ```
 
 ---
 
 ## Troubleshooting
 
-### Model fails to load (OOM)
+### `docker compose up` says `required variable LLM_API_KEY is missing a value`
 
-If you see a CUDA out-of-memory error, reduce the KV cache allocation:
+The key in `.env` is empty. Generate one:
+```bash
+sed -i "s/^LLM_API_KEY=.*/LLM_API_KEY=$(openssl rand -hex 32)/" .env
+```
+
+### Requests return `401 missing or wrong API key`
+
+The client isn't sending `LLM_API_KEY`. Send it as `Authorization: Bearer <key>` (OpenAI
+clients, `ANTHROPIC_AUTH_TOKEN`) or as `x-api-key: <key>`. If you changed the key, restart
+nginx with `docker compose up -d --force-recreate nginx`, because the key is read at startup.
+
+### vLLM fails with an unrecognised argument
+
+For example, `unrecognized arguments: --safetensors-load-strategy`, or an unknown
+speculative method `dflash`. Your image is older than vLLM 0.26. Rebuild it as in Phase 2.
+
+### Model fails to load (out of memory)
 
 ```bash
 # In docker-compose.yml, under vllm-coding command, change:
@@ -315,51 +319,53 @@ If you see a CUDA out-of-memory error, reduce the KV cache allocation:
 # or, only if that is not enough:
 #   --max-model-len 131072         (down from 262144)
 #
-# Prefer lowering utilization first: 262144 is set deliberately high because
-# Claude Code assumes a ~200K window and cannot be told the real one.
+# Prefer lowering utilization first: 262144 is set deliberately above the 200K window
+# Claude Code assumes, so its auto-compaction fires before the server's limit.
 
 docker compose up -d --force-recreate vllm-coding
 ```
 
+Also check what else is using memory with `free -h`. Everything on the box shares the same 128 GB pool.
+
 ### NVFP4 / Blackwell kernel errors on startup
 
-If vLLM fails to load the NVFP4 weights or reports unsupported quantization/kernel errors,
-your `vllm-node-v2:latest` image predates NVFP4/Blackwell support. Rebuild it:
+The image predates NVFP4 or Blackwell support. Rebuild as in Phase 2, keeping a rollback first:
 
 ```bash
-docker tag vllm-node-v2:latest vllm-node:v2-previous   # rollback — the build reuses the tag
-docker compose -f ~/llm-stack/docker-compose.yml stop vllm-coding
-cd ~/spark-vllm-docker
-git pull
-./build-and-copy.sh -t vllm-node-v2
-docker compose -f ~/llm-stack/docker-compose.yml up -d --force-recreate vllm-coding
+docker tag vllm-node-v2:latest vllm-node:v2-previous
 ```
 
-### Claude Code returns auth errors with `claude-local`
+### Claude Code can't connect
 
-Confirm the model is healthy first:
-```bash
-curl http://<dgx-ip>/coding/v1/models
-```
+1. Confirm the model is reachable through nginx:
+   ```bash
+   curl -H "Authorization: Bearer <LLM_API_KEY>" http://<dgx-ip>/coding/v1/models
+   ```
+2. Check the base URL. It must be `http://<dgx-ip>/coding`, not `/coding/v1`, because
+   Claude Code appends `/v1/messages` itself.
+3. Check that you used `ANTHROPIC_AUTH_TOKEN`, not `ANTHROPIC_API_KEY`.
 
-If that returns a model list, the issue is likely the `ANTHROPIC_BASE_URL` path.
-vLLM's Anthropic endpoint is at the root of the base URL — the path should be
-`http://<dgx-ip>/coding` (not `/coding/v1`).
+### Port 80 not reachable from another machine
+
+Check `docker compose ps` shows nginx publishing `0.0.0.0:80->80/tcp`. Then check that no
+host firewall or network ACL between the machines blocks port 80.
 
 ### nvidia-smi shows no GPU in container
 
 ```bash
 docker info | grep -i runtime
-# Should show: Runtimes: nvidia runc
-# If not:
+# Should list nvidia. If not:
 sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
 ```
 
-### Check GPU memory during inference
+### Checking GPU memory
+
+On GB10, `nvidia-smi --query-gpu=memory.used` reports `[N/A]` because memory is unified.
+Use the per-process view:
 
 ```bash
-nvidia-smi --query-gpu=memory.used,memory.free,memory.total --format=csv
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+# VLLM::EngineCore should show roughly 90,000–93,000 MiB
+free -h     # whole-box view
 ```
-
-With the model loaded you should see ~100–110 GB used out of 128 GB.

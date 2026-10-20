@@ -1,9 +1,26 @@
 #!/usr/bin/env python3
-"""Functional validation of the deployed stack for Hermes + Claude Code paths."""
-import json, sys, urllib.request, urllib.error
+"""Functional validation of the deployed stack: the direct OpenAI path that
+on-host agents use, and the nginx + shim Anthropic path that Claude Code uses.
 
-DIRECT = "http://localhost:8001"       # Hermes talks here (OpenAI API)
-NGINX = "http://localhost/coding"      # Claude Code talks here (Anthropic API via shim)
+Env: VLLM_BASE (default http://localhost:8001), NGINX_BASE (default
+http://localhost/coding), LLM_API_KEY (default: read from ../.env)."""
+import json, os, pathlib, sys, urllib.request, urllib.error
+
+DIRECT = os.environ.get("VLLM_BASE", "http://localhost:8001")         # on-host agents (OpenAI API)
+NGINX = os.environ.get("NGINX_BASE", "http://localhost/coding")       # Claude Code (Anthropic API via shim)
+
+
+def api_key():
+    if os.environ.get("LLM_API_KEY"):
+        return os.environ["LLM_API_KEY"]
+    env = pathlib.Path(__file__).resolve().parent.parent / ".env"
+    if env.exists():
+        for line in env.read_text().splitlines():
+            if line.startswith("LLM_API_KEY="):
+                return line.split("=", 1)[1].strip()
+    return ""
+
+
 results = []
 
 
@@ -32,7 +49,7 @@ def t_models():
 
 
 def t_tool_call():
-    """Hermes depends entirely on OpenAI-style function calling."""
+    """Agents depend on OpenAI-style function calling."""
     r = post(DIRECT + "/v1/chat/completions", {
         "model": "coding",
         "messages": [{"role": "user",
@@ -55,7 +72,7 @@ def t_tool_call():
 
 
 def t_multi_tool():
-    """Hermes chains tools; verify a second round-trip with a tool result works."""
+    """Agents chain tools; verify a second round-trip with a tool result works."""
     r = post(DIRECT + "/v1/chat/completions", {
         "model": "coding",
         "messages": [
@@ -85,7 +102,7 @@ def t_reasoning():
                                  "with the amount."}],
         "max_tokens": 6000, "temperature": 0.0})
     msg = r["choices"][0]["message"]
-    # vLLM 0.26.1 names this field `reasoning` (older builds: `reasoning_content`)
+    # vLLM 0.26.1+ names this field `reasoning` (older builds: `reasoning_content`)
     rc = msg.get("reasoning") or msg.get("reasoning_content")
     c = msg.get("content") or ""
     return ("05" in c.replace(".", "").replace("$", "") and bool(rc)), \
@@ -93,7 +110,8 @@ def t_reasoning():
 
 
 def t_long_context():
-    """Claude Code sends ~150-200K prompts; prove the ceiling is real."""
+    """Claude Code sends prompts up to ~200K tokens; prove the 262144 ceiling is real
+    with a ~242K-token prompt."""
     filler = "\n".join(f"line {i}: the quick brown fox jumps over the lazy dog #{i}"
                        for i in range(11000))
     body = {"model": "coding", "messages": [
@@ -118,7 +136,7 @@ def t_anthropic_path():
         "messages": [
             {"role": "system", "content": "Always end your reply with OK."},
             {"role": "user", "content": "Say hello in exactly one short sentence."},
-        ]}, headers={"anthropic-version": "2023-06-01", "x-api-key": "none"})
+        ]}, headers={"anthropic-version": "2023-06-01", "x-api-key": api_key()})
     blocks = r.get("content", [])
     text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
     kinds = [b.get("type") for b in blocks]
@@ -143,10 +161,10 @@ def t_streaming():
 
 for name, fn in [
     ("model metadata / context window", t_models),
-    ("OpenAI tool calling (Hermes core)", t_tool_call),
+    ("OpenAI tool calling", t_tool_call),
     ("tool result round-trip", t_multi_tool),
     ("reasoning parser", t_reasoning),
-    ("long context recall (~150K)", t_long_context),
+    ("long context recall (~240K)", t_long_context),
     ("Anthropic /v1/messages via nginx+shim", t_anthropic_path),
     ("SSE streaming", t_streaming),
 ]:

@@ -63,9 +63,14 @@ def crash_reason():
 
 
 def main():
-    if not ORIG.exists():
-        shutil.copy(COMPOSE, ORIG)
-        print(f"saved original -> {ORIG}")
+    if ORIG.exists():
+        # Left behind by a sweep that was killed before it could restore. Reusing it
+        # would silently revert any compose edits made since, so stop and ask.
+        sys.exit(f"{ORIG} already exists — a previous sweep did not finish.\n"
+                 f"Compare it with {COMPOSE}, restore whichever is correct, delete it, "
+                 "and re-run.")
+    shutil.copy(COMPOSE, ORIG)
+    print(f"saved original -> {ORIG}")
 
     try:
         for label, cfg in CONFIGS:
@@ -79,10 +84,11 @@ def main():
                 print(crash_reason(), flush=True)
                 continue
             print(f"    healthy in {secs:.0f}s", flush=True)
-            subprocess.run([sys.executable, str(SCRATCH / "bench_hermes.py"), label, "5"],
+            subprocess.run([sys.executable, str(HERE / "bench.py"), label, "5"],
                            check=False)
     finally:
         shutil.copy(ORIG, COMPOSE)
+        ORIG.unlink()
         print("\ndocker-compose.yml restored to pre-sweep state "
               "(container still running the LAST swept config).")
 

@@ -1,45 +1,236 @@
-# DGX Spark — LLM Inference Stack
+# DGX Spark — Qwen3.6 on vLLM, tuned for coding agents
 
-Single-model vLLM inference server behind Nginx, managed with Docker Compose.
-Turns a DGX Spark into a private, OpenAI- and Anthropic-compatible coding API for
-Claude Code and IDE assistants. vLLM serves both the OpenAI API (`/v1/chat/completions`)
-and the Anthropic API (`/v1/messages`) natively, but Claude Code injects a
-`system`-role message inside the `messages` array — something vLLM rejects with a 400.
-A dependency-free, stdlib-only normalizing shim hoists those system messages into
-vLLM's top-level `system` field before forwarding, preserving the Anthropic response
-shape (including `thinking` blocks) so no separate translation proxy is needed.
-OpenAI-compatible clients connect directly through Nginx — they bypass the shim entirely
-because vLLM speaks OpenAI natively.
+A single-model vLLM inference server for an NVIDIA DGX Spark (or another GB10-based
+128 GB box), managed with Docker Compose. It turns the machine into a private coding API
+that speaks both the **OpenAI** API (`/v1/chat/completions`) and the **Anthropic** API
+(`/v1/messages`), so Claude Code, IDE assistants and local agents can all use it.
 
-**Model:** `nvidia/Qwen3.6-35B-A3B-NVFP4` — 35B MoE (3B active), Blackwell NVFP4, 256K context, tool-calling,
-with DFlash speculative decoding (~112 tok/s single-stream, ~235 tok/s at 4 concurrent —
-see [Measured performance](#measured-performance)).
-The stack is model-agnostic; see [Swapping the model](#swapping-the-model) to use a different one.
+- **Model:** [`nvidia/Qwen3.6-35B-A3B-NVFP4`](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4):
+  a 35B mixture-of-experts model (~3B active per token), 4-bit NVFP4, 256K context, tool calling.
+- **Speed:** ~112 tok/s for a single request, ~235 tok/s aggregate at 4 concurrent requests,
+  using DFlash speculative decoding ([measured](#measured-performance)).
+- **Front door:** nginx on port 80 with a required API key. A small stdlib-only shim fixes the
+  one incompatibility between Claude Code and vLLM's Anthropic endpoint: Claude Code puts
+  `system`-role messages inside `messages[]`, which vLLM rejects.
 
-**Primary workload:** [Hermes Agent](OPTIMIZATION_REPORT.md), running on the host and
-connecting **straight to `localhost:8001`** over the OpenAI API — it bypasses Nginx and the
-shim, because it runs locally and speaks OpenAI natively, so there is nothing to proxy or
-translate. Claude Code and other network clients come in through Nginx. The tuning in
-[OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md) was driven by Hermes' traffic shape:
-tool-call and code-edit heavy, which is what selected DFlash speculative decoding.
+![Architecture](dgx_spark_vllm_stack_v2.svg)
+
+**Last validated:** 2026-10-04: vLLM 0.30.0, FlashInfer 0.7.1, driver 580.173.02, on a
+GIGABYTE AI TOP ATOM (GB10, 128 GB). All seven checks in [`bench/validate.py`](bench/validate.py) pass.
+
+The tuning targets agentic coding traffic, which is mostly tool calls and code edits. That
+is why DFlash speculative decoding was chosen; [TUNING.md](TUNING.md) has the measurements.
 
 ## Documentation
 
-| Doc | Purpose |
-|-----|---------|
-| **README.md** (this file) | Quick start, API access, day-to-day operations |
-| [SETUP_GUIDE.md](SETUP_GUIDE.md) | End-to-end setup from a fresh DGX Spark (Docker, NVIDIA toolkit, vLLM image build) |
-| [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) | The "why" — architecture, design decisions, and the reasoning behind each config choice |
-| [OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md) | What was tested, how it was measured, results, and why each setting was chosen |
-| [PERFORMANCE_PLAYBOOK.md](PERFORMANCE_PLAYBOOK.md) | Ranked tuning levers, negative results, and how to evaluate a new model |
+| Doc | Read it for |
+|-----|-------------|
+| **README.md** (this file) | Quick start, connecting clients, day-to-day operations |
+| [SETUP_GUIDE.md](SETUP_GUIDE.md) | The same setup in more detail, with verification at each step and troubleshooting |
+| [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) | How the stack works and why each config choice was made |
+| [TUNING.md](TUNING.md) | What drives speed on GB10, what was measured, what didn't help, and how to evaluate a new model or vLLM build |
 | [bench/](bench/) | Benchmark harness, config sweeper, and the functional validation suite |
+
+## Requirements
+
+- **Hardware:** NVIDIA GB10 with 128 GB unified memory (DGX Spark or an OEM equivalent).
+- **OS:** DGX OS. It ships with the NVIDIA driver (580.x is required for NVFP4), Docker,
+  and the NVIDIA Container Toolkit already configured. On other Ubuntu installs, see
+  [SETUP_GUIDE.md → Phase 1](SETUP_GUIDE.md#phase-1--system-dependencies).
+- **vLLM image:** built locally from [`eugr/spark-vllm-docker`](https://github.com/eugr/spark-vllm-docker).
+  This compose file needs **vLLM 0.26 or newer**, because it uses DFlash and
+  `--safetensors-load-strategy`. It was validated on 0.30.0, and step 2 below builds exactly that.
+- **Disk:** ~25 GB for model weights plus ~25 GB for the vLLM image.
+
+---
+
+## Quick start
+
+### 1. Clone this repository
+
+```bash
+git clone https://github.com/trobdev/dgxspark-vllm-qwen.git ~/dgxspark-vllm-qwen
+cd ~/dgxspark-vllm-qwen
+```
+
+### 2. Build the vLLM image (~40 minutes)
+
+This builds the exact version validated here: vLLM v0.30.0, compiled from source. Stop
+anything else using GPU memory first. A source build alongside a resident model ran the
+box out of unified memory.
+
+```bash
+git clone https://github.com/eugr/spark-vllm-docker.git ~/spark-vllm-docker
+cd ~/spark-vllm-docker
+git checkout f7d6e3b       # build-script version used for the validated image
+./build-and-copy.sh -t vllm-node-v2 --vllm-ref v0.30.0 --apply-preset-vllm-prs -j 8
+cd ~/dgxspark-vllm-qwen
+```
+
+- **`-t vllm-node-v2` is required.** The script's default tag is `vllm-node`, which this
+  compose file doesn't use.
+- **FlashInfer isn't pinned by this command.** It comes from the build repo's prebuilt
+  wheel, which was 0.7.1 when this stack was validated. To pin it as well, add
+  `--flashinfer-ref v0.7.1`. That compiles FlashInfer from source too, which adds time.
+- **Faster, unpinned alternative:** `./build-and-copy.sh -t vllm-node-v2` takes ~15–20
+  minutes because it uses the build repo's current prebuilt wheels. You get whatever vLLM
+  version those wheels are, which hasn't been validated here, so run step 6.
+
+Check the result:
+
+```bash
+docker run --rm --runtime=nvidia vllm-node-v2:latest \
+  python3 -c "import vllm, flashinfer; print(vllm.__version__, flashinfer.__version__)"
+# validated build prints: 0.30.1.dev1+gbf1979fbd... 0.7.1
+```
+
+### 3. Configure
+
+```bash
+cp .env.example .env
+sed -i "s/^LLM_API_KEY=.*/LLM_API_KEY=$(openssl rand -hex 32)/" .env
+grep LLM_API_KEY .env      # every client needs this key
+```
+
+`.env` holds:
+
+- `LLM_API_KEY` (**required**): nginx rejects any `/coding/` request without it, and
+  `docker compose up` refuses to start if it's empty.
+- `MODEL_PATH`: where the weights live. Defaults to `/data/models`.
+- `HF_TOKEN`: optional. Both models are public, so you can leave it empty.
+
+### 4. Download the models (~23 GB)
+
+```bash
+sudo mkdir -p /data/models && sudo chown $USER:$USER /data/models   # or your MODEL_PATH
+./download-models.sh
+```
+
+This downloads the target model and the DFlash draft model, and you need both. The script
+reads `.env`. It runs the Hugging Face CLI in a throwaway container if `hf` isn't
+installed on the host. If a download is interrupted, re-run the script and it resumes.
+
+### 5. Start
+
+```bash
+docker compose up -d
+docker compose logs -f vllm-coding     # Ctrl-C once you see "Application startup complete."
+```
+
+The first start takes **6–8 minutes**, measured at 341–461s. It loads weights, allocates
+the KV cache, compiles kernels, and runs autotuning. Later restarts reuse the `vllm-cache`
+volume and take ~5 minutes (285–294s). nginx and the shim wait until vLLM is healthy.
+The healthcheck allows 600s before it starts counting failures.
+
+### 6. Validate
+
+```bash
+python3 bench/validate.py     # 7 checks, ~2 minutes; exits non-zero on failure
+```
+
+The checks cover tool calling, reasoning separation, recall from a ~242K-token prompt, the
+Anthropic path through nginx and the shim, and streaming. The script uses only the Python
+standard library.
+
+---
+
+## Connecting clients
+
+| Protocol  | URL                                      | Model name | API key |
+|-----------|------------------------------------------|------------|---------|
+| OpenAI    | `http://<dgx-ip>/coding/v1`              | `coding`   | your `LLM_API_KEY` |
+| Anthropic | `http://<dgx-ip>/coding` (base URL only) | `coding`   | your `LLM_API_KEY` |
+
+`<dgx-ip>` is the Spark's address on your network (`hostname -I`), or `localhost` on the Spark itself.
+
+### OpenAI SDK
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://<dgx-ip>/coding/v1", api_key="<LLM_API_KEY>")
+
+response = client.chat.completions.create(
+    model="coding",
+    messages=[{"role": "user", "content": "Write a binary search in Python."}],
+)
+print(response.choices[0].message.content)
+```
+
+**Thinking is on by default.** The model reasons before answering, and the reasoning comes
+back in a separate `reasoning` field. Turn it off for faster, simpler replies:
+
+```python
+response = client.chat.completions.create(
+    model="coding",
+    messages=[{"role": "user", "content": "Say ok."}],
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
+```
+
+Tested: this produces 0 reasoning tokens. A `/no_think` system message does **not** work
+with Qwen3.6; reasoning still runs.
+
+### Claude Code
+
+Add an alias to `~/.bashrc` or `~/.zshrc`:
+
+```bash
+alias claude-local='env -u ANTHROPIC_API_KEY \
+  ANTHROPIC_BASE_URL=http://<dgx-ip>/coding \
+  ANTHROPIC_AUTH_TOKEN=<LLM_API_KEY> \
+  ANTHROPIC_DEFAULT_OPUS_MODEL=coding \
+  ANTHROPIC_DEFAULT_SONNET_MODEL=coding \
+  ANTHROPIC_DEFAULT_HAIKU_MODEL=coding \
+  claude'
+```
+
+Run `claude-local` for the local model and plain `claude` for Anthropic's API. Tested with
+Claude Code 2.1.233.
+
+- **`ANTHROPIC_AUTH_TOKEN`** sends the key as `Authorization: Bearer`, which nginx accepts.
+- **`env -u ANTHROPIC_API_KEY`** keeps a real Anthropic key, if you have one exported, from
+  also being sent to this server in plain HTTP.
+- **The `ANTHROPIC_DEFAULT_*_MODEL` variables** map Claude Code's opus, sonnet and haiku
+  slots to the served model name `coding`.
+- **Context window:** Claude Code assumes a 200K-token window for a model name it doesn't
+  recognise, and compacts the conversation to stay inside it. The server allows 262,144
+  tokens, so it has margin. Leave `CLAUDE_CODE_MAX_CONTEXT_TOKENS` unset, or keep it well
+  below 262,144, because the prompt plus the output must fit.
+
+### Cursor, Continue, and other IDE tools
+
+Set the OpenAI base URL to `http://<dgx-ip>/coding/v1`, the model to `coding`, and the
+API key to your `LLM_API_KEY`. For Continue (`~/.continue/config.yaml`):
+
+```yaml
+models:
+  - name: Qwen3.6 Coding (local)
+    provider: openai
+    model: coding
+    apiBase: http://<dgx-ip>/coding/v1
+    apiKey: <LLM_API_KEY>
+    requestOptions:
+      extraBodyProperties:
+        chat_template_kwargs:
+          enable_thinking: false   # skip reasoning for IDE edits
+    roles: [chat, edit]
+```
+
+### Agents on the same machine
+
+A process running on the Spark itself can skip nginx and the key, and call vLLM directly at
+`http://localhost:8001/v1` using the OpenAI API. That port is bound to `127.0.0.1` only.
+The context window there is reported at `/v1/models`.
+
+---
 
 ## Measured performance
 
 GIGABYTE AI TOP ATOM (GB10, 128 GB unified, driver 580.173.02), vLLM 0.30.0, the config in
 `docker-compose.yml` as shipped. Measured 2026-10-04, n=14 per workload.
 
-**Decode rate by workload** — single request (c=1), tokens/sec:
+**Decode rate by workload**, single request (c=1), in tokens per second:
 
 | Workload | tok/s | What it represents |
 |---|---|---|
@@ -52,7 +243,7 @@ GIGABYTE AI TOP ATOM (GB10, 128 GB unified, driver 580.173.02), vLLM 0.30.0, the
 
 Speculative acceptance: **53.0%** (DFlash, 4 draft tokens).
 
-**What the tuning bought** — same hardware, same model (vLLM 0.26.1, n=14 for finalists):
+**What the tuning bought.** Same hardware and model, on vLLM 0.26.1 (n=14 for the finalists):
 
 | Configuration | c=1 tok/s | c=4 aggregate |
 |---|---|---|
@@ -61,8 +252,8 @@ Speculative acceptance: **53.0%** (DFlash, 4 draft tokens).
 | MTP, 3 draft tokens | 108.9 | 208.8 |
 | **DFlash, 4 draft tokens (deployed)** | **111.4** | **227.8** |
 
-The upstream default draft length was *slower than no speculation at all* at c=4. Upgrading
-vLLM 0.26.1 → 0.30.0 changed nothing measurable (every delta inside the noise floor).
+The upstream default draft length was *slower than no speculation at all* at c=4. The
+upgrade from vLLM 0.26.1 to 0.30.0 changed nothing measurable; every delta was inside the noise floor.
 
 **Other measured figures:**
 
@@ -71,150 +262,20 @@ vLLM 0.26.1 → 0.30.0 changed nothing measurable (every delta inside the noise 
 | Long-context recall | 241,815-token prompt, specific line retrieved verbatim |
 | Cold start (container start → serving) | 341–461s; 347s on the first 0.30.0 start |
 | Warm recreate (`vllm-cache` volume populated) | 285–294s |
-| GPU memory committed | ~91 GiB of ~121 GiB usable (`--gpu-memory-utilization 0.75`) |
+| GPU memory committed by vLLM | ~91 GiB of ~121 GiB usable (`--gpu-memory-utilization 0.75`) |
 
-**How these were measured:** decode rate only — streamed, with time-to-first-token excluded so
-prefill and prefix-cache hits don't inflate the number; temperature 0; prompts drawn from a
-real agent workload rather than a synthetic benchmark; medians over n trials. Run-to-run
-noise is about ±2–3% at c=1 and ±7% at c=4, so smaller differences are not meaningful.
-Workload choice matters more than most config changes — note the ~20% spread between `prose`
-and `code_edit` on identical settings. Reproduce with `python3 bench/bench_hermes.py <label> 14`;
-full method and history in [OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md).
+**How these were measured:**
 
-## Prerequisites
+- **Decode rate only.** Requests are streamed and time-to-first-token is excluded, so prefill
+  and prefix-cache hits don't inflate the number.
+- **Conditions:** temperature 0, prompts drawn from a real agent workload, medians over n trials.
+- **Noise:** run-to-run noise is about ±2–3% at c=1 and ±7% at c=4, so smaller differences
+  are not meaningful.
+- **Workload choice matters more than most config changes:** `prose` and `code_edit` differ
+  by ~20% on identical settings.
 
-- Docker Engine with the NVIDIA Container Toolkit installed and the runtime configured
-- `vllm-node-v2:latest` image built locally (see SETUP_GUIDE.md — must be vLLM ≥ 0.19 for NVFP4)
-- ~30 GB of free disk space for model weights (22 GB target model + 0.8 GB DFlash draft model)
-
-> On a stock **DGX Spark**, Docker Engine and the NVIDIA Container Toolkit/runtime are
-> preinstalled and configured out of the box — the first bullet is already done. See
-> [SETUP_GUIDE.md → Phase 1](SETUP_GUIDE.md#phase-1--system-dependencies) for the quick
-> verification commands.
-
----
-
-## First-time setup
-
-### 1. Configure your environment
-
-```bash
-cp .env.example .env
-# Edit .env and set HF_TOKEN to your HuggingFace token
-```
-
-The model is a gated HuggingFace repo — accept the license on the
-[model page](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) before downloading.
-
-### 2. Download model weights
-
-```bash
-chmod +x download-models.sh
-./download-models.sh
-```
-
-### 3. Start the stack
-
-```bash
-docker compose up -d
-```
-
-Watch startup (a recreate with the `vllm-cache` volume warm measures 285–294s — weights
-load, the KV cache pool is allocated, and CUDA graphs compile. A true cold start, with that
-cache empty, adds roughly 117s of torch.compile and FlashInfer autotune on top. The
-healthcheck allows 600s before it counts failures, which is sized for the cold case):
-
-```bash
-docker compose logs -f vllm-coding
-```
-
-A healthy startup ends with:
-```
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://0.0.0.0:8000
-```
-
----
-
-## API access
-
-The model is served at an OpenAI-compatible endpoint and an Anthropic-compatible endpoint:
-
-| Protocol   | URL                                       | Model name |
-|------------|-------------------------------------------|------------|
-| OpenAI     | `http://<dgx-ip>/coding/v1`               | `coding`   |
-| Anthropic  | `http://<dgx-ip>/coding` (base URL only)  | `coding`   |
-
-### OpenAI SDK
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://<dgx-ip>/coding/v1",
-    api_key="none",
-)
-
-response = client.chat.completions.create(
-    model="coding",
-    messages=[{"role": "user", "content": "Write a binary search in Python."}],
-)
-print(response.choices[0].message.content)
-```
-
-### With thinking mode enabled (extended reasoning)
-
-```python
-response = client.chat.completions.create(
-    model="coding",
-    messages=[{"role": "user", "content": "Design a thread-safe LRU cache in Python."}],
-    extra_body={"chat_template_kwargs": {"enable_thinking": True}},
-)
-```
-
----
-
-## Claude Code integration
-
-Claude Code can use this server as a drop-in replacement for Anthropic's API, or you can
-switch between local and SaaS per session using shell aliases.
-
-### Shell aliases (recommended)
-
-Add to `~/.bashrc` or `~/.zshrc`:
-
-```bash
-# Use local DGX model
-alias claude-local='ANTHROPIC_BASE_URL=http://<dgx-ip>/coding \
-  ANTHROPIC_API_KEY=none \
-  ANTHROPIC_DEFAULT_OPUS_MODEL=coding \
-  ANTHROPIC_DEFAULT_SONNET_MODEL=coding \
-  ANTHROPIC_DEFAULT_HAIKU_MODEL=coding \
-  claude'
-
-# Use Anthropic SaaS models (Opus, Sonnet, etc.) — uses real API key from env
-alias claude-saas='claude'
-```
-
-Replace `<dgx-ip>` with your DGX Spark's IP address.
-
-**Notes:**
-- `ANTHROPIC_BASE_URL` is read once at Claude Code startup — restart Claude Code to switch.
-- The `ANTHROPIC_*_MODEL` vars map Claude Code's internal model references to your served model name.
-- vLLM must be running and healthy before starting Claude Code against it.
-
-### IDE / Cursor / Continue.dev
-
-Point at the OpenAI-compatible endpoint:
-
-| Tool         | Setting          | Value                              |
-|--------------|------------------|------------------------------------|
-| Cursor       | OpenAI Base URL  | `http://<dgx-ip>/coding/v1`        |
-| Continue.dev | `apiBase`        | `http://<dgx-ip>/coding/v1`        |
-
-Model name: `coding`, API key: `none`.
-
-> **Continue.dev:** Also add `systemMessage: "/no_think"` to your model entry in `~/.continue/config.yaml`. The model reasons by default and Continue's OpenAI adapter cannot handle the `reasoning_content` delta field vLLM emits for thinking tokens — the directive suppresses it.
+Reproduce with `python3 bench/bench.py <label> 14`. The full method and results are in
+[TUNING.md](TUNING.md).
 
 ---
 
@@ -226,89 +287,95 @@ Model name: `coding`, API key: `none`.
 | Stop                    | `docker compose down`                         |
 | Restart model only      | `docker compose restart vllm-coding`          |
 | View live logs          | `docker compose logs -f vllm-coding`          |
-| Check GPU usage         | `nvidia-smi`                                  |
-| Health check            | `curl http://localhost:8001/health`           |
-| Update vLLM image       | See [Important: vLLM image requirement](#important-vllm-image-requirement) |
+| Health (direct, on host)| `curl http://localhost:8001/health`           |
+| Health (through nginx)  | `curl http://localhost/health`                |
+| GPU memory in use       | `nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv` |
+| Validate after a change | `python3 bench/validate.py`                   |
+
+On GB10, `nvidia-smi --query-gpu=memory.used` reports `[N/A]` because memory is unified.
+Use the per-process query above, or `free -h` for the whole box.
+
+Containers use `restart: "no"` on purpose, so a crash stays visible instead of
+restart-looping. To have the stack come back after a reboot, change it to
+`restart: unless-stopped`, or use the systemd unit in
+[SETUP_GUIDE.md → Phase 7](SETUP_GUIDE.md#phase-7--optional-system-autostart).
 
 ---
 
 ## GPU memory
 
-With `--gpu-memory-utilization 0.75` vLLM commits ~91 GiB of the ~121 GiB usable pool,
-leaving the rest as headroom:
+With `--gpu-memory-utilization 0.75`, vLLM commits ~91 GiB of the ~121 GiB usable pool:
 
 | Allocation                | Approx size  |
 |---------------------------|--------------|
 | NVFP4 weights             | 21.9 GiB     |
 | DFlash draft model        | 0.7 GiB      |
 | KV cache + activations    | 68.6 GiB     |
-| Free headroom             | ~30 GiB      |
+| Not committed to vLLM (OS, Docker, other processes) | ~30 GiB |
 
-Measured live at 93,381 MiB. vLLM reports a KV pool of 2,453,340 tokens — about
-**9 concurrent sequences at the full 256K context**, proportionally more at shorter ones.
+Measured live at 93,381 MiB. vLLM reports a KV pool of 2,453,340 tokens, which is about
+**9 concurrent sequences at the full 256K context**, and proportionally more at shorter ones.
 
-**Why 0.75 rather than higher:** this is unified memory, shared with the OS and every other
-process, and host usage grows over days of uptime. At 0.85 the box sat at ~122 GB of 128 GB
-with no margin. Utilization buys KV capacity, **not throughput**, so the headroom is free in
-tokens/second terms.
+**Why 0.75 rather than higher.** The memory is unified: the OS and every other process
+share the same pool, and host usage grows over days of uptime. At 0.85 the whole box sat at
+~122 GB of 128 GB with no margin. At 0.75, ~17 GiB of host memory stays free. Higher
+utilization buys KV capacity, **not throughput**, so the headroom costs nothing in tokens per second.
 
-If the model OOMs on startup, lower `--gpu-memory-utilization` further before reducing
-`--max-model-len` — but see the note in
+If the model runs out of memory at startup, lower `--gpu-memory-utilization` before
+reducing `--max-model-len`. See
 [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md#throughput-expectations-and-limitations)
-on why 262144 is set deliberately high for Claude Code.
+for why 262144 is set deliberately.
 
 ---
 
 ## Security
 
-This stack ships with **no authentication and no TLS** by default — it is built for a
-single developer or a trusted LAN.
-
-- **No API auth.** Nginx forwards every `/coding/` request and the served key is `none`.
-  Anyone who can reach the port has full use of the model, and your prompts (including
-  source code) pass through it. Add a bearer-token check to the `/coding/` block in
-  [nginx/nginx.conf](nginx/nginx.conf) before exposing it beyond a network you control —
-  see [IMPLEMENTATION_GUIDE.md → Configure Nginx](IMPLEMENTATION_GUIDE.md#step-5--configure-nginx).
-- **No TLS.** Port 80 is plaintext. Enable the HTTPS block and add certs if the segment
-  isn't fully trusted.
-- **Debug port is loopback-only.** vLLM's direct port is published as `127.0.0.1:8001`
-  so it can't be reached from the network (it would bypass Nginx). Keep it that way.
-- **Do not port-forward `80`/`443`/`8001` to the internet** without adding auth and TLS first.
+- **API key required.** nginx returns `401` for any `/coding/` request without
+  `LLM_API_KEY`, sent either as `Authorization: Bearer` or as `x-api-key`. `/health` and `/`
+  are open, but they only return fixed text.
+- **Port 80 is on all interfaces and Docker bypasses ufw.** Ports Docker publishes are not
+  filtered by ufw, so your network boundary and the key are what protect the API. If only
+  this machine needs access, change the mapping to `"127.0.0.1:80:80"` in `docker-compose.yml`.
+- **No TLS by default.** Port 80 is plaintext, so the key and your prompts, including source
+  code, cross the network unencrypted. On any network you don't fully trust, enable the
+  HTTPS block in [`nginx/default.conf.template`](nginx/default.conf.template). Better still,
+  reach the box over a VPN such as Tailscale or WireGuard.
+- **The direct ports are loopback-only.** vLLM on `127.0.0.1:8001` and the shim on
+  `127.0.0.1:8003` have no auth. Keep them bound to loopback.
+- **Do not port-forward this to the internet.** It is built for one developer or a trusted LAN.
 
 ## Swapping the model
 
-1. Download new weights to `MODEL_PATH`
-2. Update `--model` and `--served-model-name` in `docker-compose.yml`
-3. Remove or replace `--speculative-config` — the DFlash draft model is specific to
-   Qwen3.6 and will not work with another model
-4. Drop `--reasoning-parser` / `--tool-call-parser` if the new model doesn't use Qwen3's formats
-5. `docker compose up -d --force-recreate vllm-coding`
-6. Re-sweep `num_speculative_tokens` if you add a draft model — see
-   [PERFORMANCE_PLAYBOOK.md](PERFORMANCE_PLAYBOOK.md)
+1. Download the new weights to `MODEL_PATH`.
+2. Update `--model` and `--served-model-name` in `docker-compose.yml`. `HF_HUB_OFFLINE=1`
+   is set, so `--model` must be a local path under `/models`, not a hub ID.
+3. Remove or replace `--speculative-config`. The DFlash draft model is specific to
+   Qwen3.6 and won't work with another model.
+4. Drop `--reasoning-parser`, `--tool-call-parser` and `--language-model-only` if the new
+   model doesn't use Qwen3's formats.
+5. Run `docker compose up -d --force-recreate vllm-coding`, then `python3 bench/validate.py`.
+   The checks assume `max_model_len=262144` and a reasoning model, so adjust them as needed.
+6. If you add a draft model, re-sweep `num_speculative_tokens`. See
+   [TUNING.md §4.1](TUNING.md#41-speculative-decoding--the-lever-that-moved).
 
----
-
-## Important: vLLM image requirement
-
-NVFP4 quantization on the GB10 Blackwell architecture requires **vLLM ≥ 0.19**.
-The `vllm-node-v2:latest` image must be rebuilt from `eugr/spark-vllm-docker` if your existing
-build predates NVFP4 support. See [SETUP_GUIDE.md](SETUP_GUIDE.md) for rebuild instructions.
-The deployed build is `0.30.1.dev1+gbf1979fbd` (vLLM v0.30.0 plus the build repo's preset PRs,
-FlashInfer 0.7.1), validated 2026-10-04 — see
-[OPTIMIZATION_REPORT.md §6.2](OPTIMIZATION_REPORT.md).
-
-To update it:
+## Updating the vLLM image
 
 ```bash
-docker tag vllm-node-v2:latest vllm-node:v2-previous   # keep a rollback — the build reuses the tag
-docker compose stop vllm-coding                        # free ~91 GiB before a from-source compile
+docker tag vllm-node-v2:latest vllm-node:v2-previous   # keep a rollback; the build reuses the tag
+docker compose stop vllm-coding                        # frees ~91 GiB before a source build
 cd ~/spark-vllm-docker && git pull
 ./build-and-copy.sh -t vllm-node-v2 --vllm-ref <tag> --apply-preset-vllm-prs -j 8
-cd ~/llm-stack && docker compose up -d && python3 bench/validate.py
+cd ~/dgxspark-vllm-qwen && docker compose up -d && python3 bench/validate.py
 ```
 
-`-t vllm-node-v2` is required: the script's default tag is `vllm-node`, which this compose
-file does not use. Stopping vLLM first matters — a from-source build at `-j 8` next to a
-resident model (~91 GiB committed) triggered the kernel OOM killer twice during the
-2026-10-04 upgrade. With the model stopped, the same build completed with no OOM events
-in 39m42s.
+- **Why stop vLLM first:** a from-source build at `-j 8` next to the resident model
+  triggered the kernel OOM killer twice. With the model stopped, the same build finished in
+  39m42s with no OOM events.
+- **Rollback:** set `image: vllm-node:v2-previous` in `docker-compose.yml`, then run
+  `docker compose up -d`.
+- **After upgrading:** benchmark before and after (see
+  [TUNING.md §7](TUNING.md#7-evaluating-a-new-model-or-vllm-build)).
+
+## License
+
+[MIT](LICENSE)

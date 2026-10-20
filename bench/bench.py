@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Benchmark vLLM against Hermes-Agent-representative workloads.
+"""Benchmark vLLM decode speed on four agentic-coding workload archetypes.
 
 Measures pure decode rate (excludes prefill/TTFT) via streaming, plus
 speculative-decode acceptance from vLLM's Prometheus metrics.
 
-Usage: bench_hermes.py <label> [trials]
+Usage: bench.py <label> [trials]
 """
 import json, os, sys, time, statistics, urllib.request, re
 from concurrent.futures import ThreadPoolExecutor
@@ -12,7 +12,10 @@ from concurrent.futures import ThreadPoolExecutor
 BASE = os.environ.get("VLLM_BASE", "http://localhost:8001")
 MAXTOK = 512
 
-# Four workload archetypes matching how Hermes actually drives this model.
+# Four workload archetypes: how an agentic coding workload drives the model.
+# Keep the prompt text byte-for-byte: the published results were measured with it, and
+# even small wording changes move the numbers (rewording the tool_call system prompt
+# shifted that workload by +22%).
 PROMPTS = {
     # 1. Agentic tool call: highly structured JSON — best case for spec decode
     "tool_call": [
@@ -44,14 +47,14 @@ def save_config(path, data):
     Path(path).write_text(json.dumps(data, indent=2))
 ```"""},
     ],
-    # 3. Content development: novel prose — worst case for spec decode
+    # 3. Long-form writing: novel prose — worst case for spec decode
     "prose": [
         {"role": "system", "content": "You are a skilled technical writer."},
         {"role": "user", "content": "Write an original 400-word blog introduction about "
          "why local inference is becoming practical for small teams. Avoid cliches and "
          "do not reuse standard marketing phrasing."},
     ],
-    # 4. General PA reasoning: mixed
+    # 4. General analysis and planning: mixed
     "reasoning": [
         {"role": "system", "content": "You are a helpful, concise personal assistant."},
         {"role": "user", "content": "I have three deadlines: a client report Friday "
@@ -130,6 +133,9 @@ def main():
             r = one(name)
             if r:
                 rates.append(r[0])
+        if not rates:
+            print(f"  c=1 {name:10s} all {trials} trials failed — is the server healthy?")
+            continue
         med = statistics.median(rates)
         spread = (max(rates) - min(rates)) / med * 100
         result["c1"][name] = {"median": med, "n": len(rates),
@@ -137,12 +143,13 @@ def main():
         print(f"  c=1 {name:10s} {med:7.1f} tok/s   (spread {spread:4.1f}%)")
 
     c1_all = [v["median"] for v in result["c1"].values()]
+    if not c1_all:
+        sys.exit("no successful requests — aborting")
     print(f"  c=1 OVERALL median-of-medians: {statistics.median(c1_all):.1f} tok/s")
 
     # --- concurrency 4: aggregate throughput (delegation / sub-agents) ---
     names = list(PROMPTS)
     aggs = []
-    import os
     for _ in range(int(os.environ.get("BENCH_C4_ROUNDS", "3"))):
         t0 = time.perf_counter()
         with ThreadPoolExecutor(max_workers=4) as ex:

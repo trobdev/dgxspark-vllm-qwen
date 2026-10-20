@@ -1,9 +1,8 @@
 # Benchmark & validation harness
 
-Standard-library Python only. Used to produce the results in
-[`../OPTIMIZATION_REPORT.md`](../OPTIMIZATION_REPORT.md).
+Standard-library Python only. Used to produce the results in [`../TUNING.md`](../TUNING.md).
 
-## `bench_hermes.py <label> [trials]`
+## `bench.py <label> [trials]`
 
 Measures **decode rate only** — streams via SSE, records time-to-first-token separately and
 excludes it, so prefill and prefix-cache effects don't contaminate the number:
@@ -23,14 +22,16 @@ Env: `VLLM_BASE` (default `http://localhost:8001`), `BENCH_C4_ROUNDS` (default 3
 `BENCH_OUTDIR` (default: this directory). Writes `res_<label>.json` with raw per-trial samples.
 
 ```bash
-python3 bench/bench_hermes.py baseline 14      # n=14, decision-grade
+python3 bench/bench.py baseline 14      # n=14, decision-grade
 ```
 
 ## `sweep.py`
 
 Rewrites the `--speculative-config` block in `docker-compose.yml`, force-recreates the
 container, polls until healthy, benchmarks, then moves to the next config. **Restores the
-original compose file on exit** (including on crash). Edit `CONFIGS`, or import and override:
+original compose file on exit** (including on crash) and removes its backup. If the process
+was killed before it could restore, the next run refuses to start until you resolve the
+leftover `docker-compose.yml.orig`. Edit `CONFIGS`, or import and override:
 
 ```python
 import sweep
@@ -44,7 +45,9 @@ volume warm, 341-461s if it is cold — so a 4-config sweep takes ~30 minutes.
 ## `validate.py`
 
 Seven functional checks across both API surfaces — run before committing any config change.
-Exits non-zero on failure.
+Exits non-zero on failure. Reads `LLM_API_KEY` from the environment or `../.env` for the nginx
+check; `VLLM_BASE` and `NGINX_BASE` override the default `http://localhost:8001` and
+`http://localhost/coding`.
 
 Covers: model metadata / context window, OpenAI tool calling, tool-result round-trip,
 reasoning/content separation, ~240K-token context recall, the Anthropic `/v1/messages` path

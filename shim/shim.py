@@ -118,9 +118,9 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(msg)
             return
 
-        self.send_response(resp.status)
+        self.send_response(resp.status)   # also emits our own Date and Server
         for k, v in resp.headers.items():
-            if k.lower() in HOP_BY_HOP:
+            if k.lower() in HOP_BY_HOP or k.lower() in ("date", "server"):
                 continue
             self.send_header(k, v)
         # We stream with unknown length, so close the hop when done.

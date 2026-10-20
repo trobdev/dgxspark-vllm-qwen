@@ -1,20 +1,17 @@
 # ─────────────────────────────────────────────────────────────────────────────
 #  Qwen3.6-35B-A3B-NVFP4 on a GB10 / DGX Spark-class box (128 GB unified).
 #
-#  This is the whole stack: vLLM, an Anthropic-compatible shim, and nginx.
-#  Claude Code and Hermes both route here.
+#  The whole stack: vLLM, an Anthropic-compatible shim, and nginx.
 #
-#      docker compose up -d      # start
+#      docker compose up -d      # start (needs LLM_API_KEY in .env)
 #      docker compose down       # stop
 #
-#  Every value below that is not a default was measured, not guessed. The
-#  reasoning is inline — read the comment before changing a flag.
-#  See OPTIMIZATION_REPORT.md for how they were derived and
-#  PERFORMANCE_PLAYBOOK.md for what was tried and rejected.
+#  Every non-default value was measured. The reason is noted next to each flag;
+#  TUNING.md has the data, including what was tried and rejected.
 #
-#  DO NOT change `name:` below. The project name binds this file to the running
-#  containers and to the dgx-llm-stack_models / dgx-llm-stack_huggingface-cache
-#  volumes; changing it would orphan both.
+#  `name:` prefixes the volumes (dgx-llm-stack_vllm-cache, ...). Changing it after
+#  the first start leaves the old volumes behind and the compile cache starts cold.
+#  The weights are a bind mount of MODEL_PATH and are unaffected.
 # ─────────────────────────────────────────────────────────────────────────────
 name: dgx-llm-stack
 
@@ -22,80 +19,58 @@ services:
 
   # ── Qwen3.6-35B-A3B-NVFP4 coding model ───────
   vllm-coding:
-    # vLLM 0.30.1.dev1+gbf1979fbd (v0.30.0 + preset PRs) / FlashInfer 0.7.1, built
-    # from source via eugr/spark-vllm-docker (f7d6e3b) on 2026-10-04:
+    # Built locally from eugr/spark-vllm-docker; needs vLLM 0.26+. Validated build
+    # (vLLM 0.30.0, FlashInfer 0.7.1), from eugr/spark-vllm-docker at f7d6e3b:
     #   ./build-and-copy.sh -t vllm-node-v2 --vllm-ref v0.30.0 --apply-preset-vllm-prs -j 8
-    # Runs directly on driver 580.173.02 (torch 2.11.0+cu130, CUDA 13.0 — no compat
-    # layer needed). Re-validated 7/7 and benchmarked at parity with 0.26.1 — see
-    # OPTIMIZATION_REPORT.md §6.2.
-    # ROLLBACK: build-and-copy.sh REUSES the vllm-node-v2 tag, so the previous build
-    # is left untagged. Tag it before rebuilding (`docker tag vllm-node-v2:latest
-    # vllm-node:v2-0.26.1`), then set `image:` to that tag and `docker compose up -d`.
-    # Older fallback: vllm-node:v1-0.22.1rc1.
+    # The build reuses this tag. To keep a rollback, run
+    # `docker tag vllm-node-v2:latest vllm-node:v2-previous` before rebuilding.
     image: vllm-node-v2:latest
     container_name: vllm-coding
     runtime: nvidia
-    restart: "no"
+    restart: "no"         # a crash stays visible; use unless-stopped to survive reboots
     networks:
       - llm-net
     volumes:
       - models:/models
       - huggingface-cache:/root/.cache/huggingface
-      # Persist vLLM's compiled artifacts across container RECREATES. Without
-      # this they live in the container's writable layer, which `compose down`
-      # destroys, so every recreate recompiles from scratch. Measured on a
-      # 2026-08-16 cold start: torch.compile + FlashInfer autotune were ~117s of
-      # a ~350s start. `docker restart` preserved them; `compose down` did not.
+      # torch.compile and FlashInfer autotune results. Without this volume they
+      # live in the container layer, which `compose down` destroys, so every
+      # recreate pays ~117s of recompilation.
       - vllm-cache:/root/.cache/vllm
-      # NOTE: ./moe-configs is intentionally NOT mounted. The only file there is
-      # E=256,N=512,...,dtype=fp8_w8a8 — tuned for the FP8 checkpoint, not NVFP4.
-      # It never applied (dtype mismatch), and forcing it to match crashed Triton
-      # with OutOfResources (shared memory 294912 required vs 101376 limit).
-      # Mounting it is a latent hazard if a future vLLM loosens its matching rules.
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - HF_TOKEN=${HF_TOKEN:-}
       - VLLM_LOGGING_LEVEL=WARNING
-      # Cold-start hygiene (Round 1, 2026-09-13). Verified before enabling:
-      # the huggingface-cache volume holds 4 KB and contains no models--* dirs,
-      # and both the checkpoint and the DFlash draft have local config.json under
-      # /models — so nothing resolves from the hub at runtime and offline mode
-      # removes a network dependency from startup without changing what loads.
-      # LAZY defers CUDA module loads until first use.
-      - CUDA_MODULE_LOADING=LAZY
+      - CUDA_MODULE_LOADING=LAZY       # defer CUDA module loads until first use
+      # Both models are on local disk (download-models.sh), so nothing needs the
+      # Hugging Face hub at runtime. --model must therefore be a local path.
       - HF_HUB_OFFLINE=1
       - TRANSFORMERS_OFFLINE=1
-      # CUTE_DSL_ARCH=sm_121a was required only for unsloth's cute-DSL b12x path.
-      # That checkpoint was benchmarked and rejected (~16% slower here), so the
-      # var is inert. See PERFORMANCE_PLAYBOOK.md §3.
     command:
       - "python3"
       - "-m"
       - "vllm.entrypoints.openai.api_server"
-      # Checkpoint choice (benchmarked 2026-08-03, tuned-vs-tuned): the nvidia/
-      # W4A16_NVFP4 checkpoint + Marlin beats unsloth's W4A4 + native FP4 by ~16%
-      # here. This box is bandwidth-bound at concurrency 1-8, so bytes/token wins
-      # and FP4 tensor cores buy nothing. unsloth's only real edge is a working
-      # FP8 KV cache (2x KV capacity) — revisit only if KV becomes binding.
+      # The NVIDIA checkpoint (W4A16, Marlin) beat unsloth's W4A4 + native FP4 by
+      # ~16% here: this box is bandwidth-bound, so the smaller file wins. TUNING.md §4.3.
       - "--model"
       - "/models/Qwen3.6-35B-A3B-NVFP4"
-      # Every client requests this id literally — Hermes config.yaml,
-      # bench/validate.py, bench/bench_hermes.py. Do not rename it.
+      # Clients request this name (your client configs, bench/validate.py,
+      # bench/bench.py). Rename it everywhere or not at all.
       - "--served-model-name"
       - "coding"
       - "--host"
       - "0.0.0.0"
       - "--port"
       - "8000"
-      # Parallel safetensors prefetch during weight load (Round 1, 2026-09-13).
-      # vLLM 0.26 replaced 0.24's `--load-format fastsafetensors` with this
-      # strategy plus tunable --safetensors-prefetch-{num-threads,block-size}.
-      # Targets the measured 341-461s cold start. Load-path only: it cannot
-      # affect steady-state decode, so it is not a throughput lever.
+      # Parallel weight loading. Load path only: cuts startup, not decode speed.
+      # (Replaces 0.24's --load-format fastsafetensors, which 0.26+ doesn't have.)
       - "--safetensors-load-strategy"
       - "prefetch"
+      # Set above the ~200K window Claude Code assumes, so its compaction fires
+      # before the server's limit. TUNING.md §4.6.
       - "--max-model-len"
       - "262144"
+      # Unified memory is shared with the OS and every other process; 0.75 leaves
+      # headroom for days of uptime. Buys KV capacity, not speed.
       - "--gpu-memory-utilization"
       - "0.75"
       - "--tensor-parallel-size"
@@ -103,64 +78,30 @@ services:
       - "--enable-prefix-caching"
       - "--max-num-seqs"
       - "32"
-      # vLLM warns the implicit 2048 starves spec-decode draft slots;
-      # upstream recipe uses 8192.
+      # vLLM warns that the implicit 2048 starves speculative-decoding draft slots.
       - "--max-num-batched-tokens"
       - "8192"
-      # Async scheduling (Round 2, 2026-09-13). NOT A PERFORMANCE CHANGE — it was
-      # ALREADY ON. vLLM 0.26 auto-enables it when nothing is incompatible, and
-      # nothing here is. Verified in config/vllm.py:1095-1141 on this build:
-      #   async_scheduling defaults to None (config/scheduler.py:148); when None,
-      #   vLLM enables it unless the model is pooling, the executor refuses, it is
-      #   ROCm DeepEP, disable_padded_drafter_batch is set (defaults False), or the
-      #   spec method is outside EagleModelTypes/NgramGPUTypes/dspark.
-      #   'dflash' IS in EagleModelTypes, and UniProcExecutor (TP=1) returns True
-      #   from supports_async_scheduling. So the None path resolved to True, and
-      #   the baseline measurement below already included async scheduling.
-      # Kept explicit deliberately, as a FAIL-LOUD GUARD, not a tuning knob: with
-      # the flag set, an incompatible future change (a vLLM upgrade that narrows
-      # the heuristic, or swapping dflash for a non-Eagle drafter) RAISES at
-      # startup (same file, the explicit branch at :1081-1095) instead of silently
-      # reverting to synchronous scheduling. Compare the compression.threshold
-      # 0.75-floor bug in Hermes: a setting that looks right while doing nothing
-      # is the expensive failure mode here, so prefer the flag that errors.
-      # Measured effect of adding it: none. n=14 before/after (functionally identical
-      # configs) came out 115.9 -> 118.6 tok/s at c=1 and 229.1 -> 245.4 at c=4 — i.e. the
-      # apparent "+7% at c=4" is pure run-to-run noise. See PERFORMANCE_PLAYBOOK.md S8.2.
+      # Already vLLM's default for this config; set explicitly so that a future
+      # incompatible change fails at startup instead of silently turning it off
+      # (the fallback is logged only at INFO, which WARNING hides).
       - "--async-scheduling"
       - "--reasoning-parser"
       - "qwen3"
       - "--enable-auto-tool-choice"
       - "--tool-call-parser"
       - "qwen3_coder"
-      - "--language-model-only"    # Skip vision encoder — not needed for coding, frees VRAM for KV cache
-      # Speculative decoding: DFlash draft model, 4 draft tokens.
-      # Swept on Hermes-representative prompts (n=14/workload), median tok/s @ c=1:
-      #   draft len:   2      3      4      6      8     15    | mtp3  | none
-      #   c=1:      96.0  106.6  111.4  111.3  107.7  104.8    | 108.9 | 77.3
-      #   c=4:     215.7  232.3  227.8  227.2  206.5  174.3    | 208.8 | 181.3
-      # Spec decode overall is worth +45% at c=1. Draft length 4 and 6 tie within
-      # noise (all |t|<1.5); 4 is chosen because it hits the same throughput at
-      # 53.1% acceptance vs 41.7% — 28% fewer wasted draft tokens, lower variance.
-      # 15 (the upstream FP8 recipe's value) was the WORST setting tested and was
-      # actually slower than no speculation at all at c=4. Do not copy vendor
-      # defaults for this parameter.
-      # vs MTP: DFlash wins tool calls +7.2% and code edits +3.2% (both p<0.05)
-      # and c=4 by +9.1%; it loses prose by 3.5%. Hermes is tool-call dominated,
-      # so this trade is favourable. MTP rollback (needs the triton moe_backend
-      # because its draft layer is unquantized BF16):
+      - "--language-model-only"    # skip the vision encoder; a coding API never gets images
+      # Speculative decoding: DFlash draft model, 4 draft tokens. Worth +44% at c=1
+      # over no speculation. The upstream default of 15 was the worst length
+      # tested, slower than no speculation at c=4. DFlash beats MTP on tool calls
+      # and code edits, and loses slightly on prose. Full sweep: TUNING.md §4.1–4.2.
+      # For prose-heavy use, MTP instead:
       #   '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}'
       - "--speculative-config"
       - '{"method":"dflash","model":"/models/Qwen3.6-35B-A3B-DFlash","num_speculative_tokens":4}'
-      # NOTE: ngram speculative decoding was removed — it crashed EngineCore on
-      # 0.22.1rc1, and when later retested scored 47.8 tok/s at 17.2% acceptance
-      # vs 123.7 for a real draft model. Draft-free speculation does NOT win on
-      # bandwidth-limited hardware: verification cost scales with draft length
-      # regardless of how the draft was produced.
     ports:
-      # Direct vLLM port — bound to loopback only (debug/local use).
-      # This bypasses Nginx, so it must NOT be reachable from the network:
-      # anything that can hit it gets unauthenticated, unencrypted model access.
+      # Direct vLLM port, loopback only. No auth, so it must not be reachable
+      # from the network; remote clients go through nginx.
       - "127.0.0.1:8001:8000"
     deploy:
       resources:
@@ -173,17 +114,14 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      # Measured cold-start across 10 container recreates (2026-08-03): 341-461s.
-      # The old 300s start_period + 5x30s retries = 450s of grace, which is BELOW
-      # an observed load time — a slow start would flip the container to unhealthy
-      # and stall nginx/anthropic-shim, both of which gate on service_healthy.
+      # Cold starts measured 341–461s. 600s covers the slowest with margin;
+      # nginx and the shim wait for this to pass.
       start_period: 600s
 
   # ── Anthropic normalizing shim ─────────────────
-  # Claude Code injects a system-role message into messages[]; vLLM's native
-  # /v1/messages rejects non-user/assistant roles. This dependency-free stdlib
-  # shim hoists system-role messages into the top-level `system` field and
-  # forwards to vLLM, keeping the native Anthropic path (preserves `thinking`).
+  # Claude Code puts system-role messages inside messages[]; vLLM's /v1/messages
+  # rejects them. This stdlib-only shim moves them into the top-level `system`
+  # field and forwards everything else untouched, including `thinking` blocks.
   anthropic-shim:
     image: python:3.12-slim
     container_name: anthropic-shim
@@ -199,10 +137,8 @@ services:
       vllm-coding:
         condition: service_healthy
     ports:
-      # Direct route to the shim for clients that set ANTHROPIC_BASE_URL, so the
-      # Anthropic path can be exercised without going through nginx. nginx still
-      # proxies this shim internally on :80 — this is an addition, not a
-      # replacement. Loopback only, for the same reason as 8001 below.
+      # Direct access to the shim for debugging without nginx. Loopback only,
+      # for the same reason as 8001.
       - "127.0.0.1:8003:8080"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz').status==200 else 1)"]
@@ -219,18 +155,27 @@ services:
     networks:
       - llm-net
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # A template: the image substitutes ${LLM_API_KEY} into it at startup.
+      - ./nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
       - ./nginx/certs:/etc/nginx/certs:ro       # Optional: add TLS certs here
+    environment:
+      # Required. Every /coding/ request must carry this key. Compose refuses to
+      # start without it, so the API can't come up open by accident.
+      - LLM_API_KEY=${LLM_API_KEY:?set LLM_API_KEY in .env (e.g. openssl rand -hex 32)}
     ports:
+      # Published on all interfaces so other machines on your LAN can connect.
+      # Docker-published ports bypass ufw, so the firewall does not restrict this;
+      # the API key and your network boundary do. For same-machine use only,
+      # change to "127.0.0.1:80:80".
       - "80:80"
-      - "443:443"
+      # - "443:443"    # enable together with the HTTPS block in the template
     depends_on:
       vllm-coding:
         condition: service_healthy
       anthropic-shim:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "nginx", "-t"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/health"]
       interval: 60s
       timeout: 5s
       retries: 3

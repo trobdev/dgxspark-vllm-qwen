@@ -1,0 +1,38 @@
+# Static checks only — no GPU in CI, so nothing here starts the model.
+name: check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compose file is valid (and refuses to start without a key)
+        run: |
+          cp .env.example .env
+          if docker compose config -q 2>/dev/null; then
+            echo "compose accepted an empty LLM_API_KEY"; exit 1
+          fi
+          # Same key format the README tells users to generate (64 hex chars).
+          sed -i "s/^LLM_API_KEY=.*/LLM_API_KEY=$(openssl rand -hex 32)/" .env
+          docker compose config -q
+
+      # Use a full-length key: an earlier version of the template broke only with
+      # 64-character keys (nginx map hash size), which a short test key hid.
+      - name: nginx template renders and parses
+        run: |
+          docker run --rm -e LLM_API_KEY="$(openssl rand -hex 32)" \
+            -v "$PWD/nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro" \
+            nginx:alpine sh -c '/docker-entrypoint.sh nginx -t'
+
+      - name: Python compiles
+        run: python3 -m py_compile shim/shim.py bench/*.py
+
+      - name: Shell scripts
+        run: |
+          bash -n download-models.sh
+          shellcheck download-models.sh
